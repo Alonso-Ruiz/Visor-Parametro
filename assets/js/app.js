@@ -68,6 +68,27 @@ const ui = {
   printDetail: $("printDetailButton"),
   tilt3d: $("tilt3dButton"),
   flat2d: $("flat2dButton"),
+  pushPull: $("pushPullButton"),
+  undoModelEdit: $("undoModelEditButton"),
+  redoModelEdit: $("redoModelEditButton"),
+  modelInteractionHint: $("modelInteractionHint"),
+  modelDimension: $("modelDimension"),
+  modelEditor: $("modelEditor"),
+  closeModelEditor: $("closeModelEditor"),
+  modelEditorLot: $("modelEditorLot"),
+  modelFaceCount: $("modelFaceCount"),
+  modelFaceList: $("modelFaceList"),
+  modelFaceControls: $("modelFaceControls"),
+  modelSelectedFace: $("modelSelectedFace"),
+  modelSelectedFaceLength: $("modelSelectedFaceLength"),
+  modelFaceOffset: $("modelFaceOffset"),
+  modelFaceOffsetNumber: $("modelFaceOffsetNumber"),
+  modelFaceLimitHint: $("modelFaceLimitHint"),
+  modelHeightInput: $("modelHeightInput"),
+  modelHeightRange: $("modelHeightRange"),
+  modelHeightLimit: $("modelHeightLimit"),
+  modelHeightDown: $("modelHeightDown"),
+  modelHeightUp: $("modelHeightUp"),
   mapModelHud: $("mapModelHud"),
   mapLotCode: $("mapLotCode"),
   modelSelectionLabel: $("modelSelectionLabel"),
@@ -99,6 +120,18 @@ const state = {
   satelliteOpacity: 0.5,
   currentUse: "multifamiliar",
   lastModel: null,
+  pushPullMode: false,
+  modelEdits: loadSavedModelEdits(),
+  wallEdits: loadSavedWallEdits(),
+  modelEditUndo: [],
+  modelEditRedo: [],
+  modelInputs: [],
+  activeModelDrag: null,
+  modelDimension: null,
+  selectedWall: null,
+  pendingWallControl: null,
+  pendingHeightControl: null,
+  suppressNextMapClick: false,
   ready: false,
 };
 
@@ -264,12 +297,14 @@ function installMapLayers() {
       "fill-extrusion-vertical-gradient": true,
     },
   });
+  map.addSource("pushpull-face", { type: "geojson", data: emptyCollection() });
+  map.addLayer({ id: "pushpull-face", type: "fill-extrusion", source: "pushpull-face", paint: { "fill-extrusion-color": ["get", "color"], "fill-extrusion-base": ["get", "base"], "fill-extrusion-height": ["get", "height"], "fill-extrusion-opacity": 0.82 } });
   if (typeof map.setLight === "function") map.setLight({ anchor: "map", color: "#ffffff", intensity: 0.58, position: [1.2, 205, 38] });
 
   const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, offset: 12, className: "lot-popup" });
   map.on("mousemove", (event) => {
     const lotFeature = map.queryRenderedFeatures(event.point, { layers: ["lots-fill"] })[0];
-    map.getCanvas().style.cursor = lotFeature ? "pointer" : "";
+    map.getCanvas().style.cursor = state.activeModelDrag ? (state.activeModelDrag.type === "wall" ? "move" : "ns-resize") : (state.pushPullMode ? "crosshair" : (lotFeature ? "pointer" : ""));
     if (!lotFeature) {
       popup.remove();
       return;
@@ -278,6 +313,7 @@ function installMapLayers() {
     if (lot) popup.setLngLat(event.lngLat).setHTML(`<b>Lote ${escapeHtml(lot.properties.cod_lote || lot.properties.id)}</b><br>${escapeHtml(lot.properties.zona)} · ${nf0.format(featureArea(lot))} m²`).addTo(map);
   });
   map.on("click", (event) => {
+    if (state.suppressNextMapClick) { state.suppressNextMapClick = false; return; }
     const lotFeature = map.queryRenderedFeatures(event.point, { layers: ["lots-fill"] })[0];
     const lot = lotFeature ? state.featureById.get(String(lotFeature.properties.id)) : null;
     if (lot) {
@@ -295,6 +331,27 @@ function installMapLayers() {
 }
 
 function emptyCollection() { return { type: "FeatureCollection", features: [] }; }
+
+function loadSavedModelEdits() {
+  try {
+    const entries = JSON.parse(localStorage.getItem("sanborja-model-edits-v1") || "[]");
+    return new Map(Array.isArray(entries) ? entries.filter((entry) => Array.isArray(entry) && entry.length === 2 && Number.isFinite(Number(entry[1]))) : []);
+  } catch { return new Map(); }
+}
+
+function loadSavedWallEdits() {
+  try {
+    const entries = JSON.parse(localStorage.getItem("sanborja-wall-edits-v1") || "[]");
+    return new Map(Array.isArray(entries) ? entries.filter((entry) => Array.isArray(entry) && entry.length === 2 && entry[1] && typeof entry[1] === "object") : []);
+  } catch { return new Map(); }
+}
+
+function persistModelEdits() {
+  try { localStorage.setItem("sanborja-model-edits-v1", JSON.stringify([...state.modelEdits])); }
+  catch (error) { console.warn("No se pudo guardar el modelo editado en este navegador.", error); }
+  try { localStorage.setItem("sanborja-wall-edits-v1", JSON.stringify([...state.wallEdits])); }
+  catch (error) { console.warn("No se pudieron guardar las paredes editadas en este navegador.", error); }
+}
 
 function normalizeRoadCollection(collection) {
   return {
@@ -341,6 +398,8 @@ function selectFeature(feature, zoom = true, additive = false, range = false) {
 
   if (!state.selectedFeatures.length) {
     state.selectedFeature = null;
+    state.selectedWall = null;
+    renderModelEditor();
     if (state.ready) {
       map.setFilter("lot-selected-fill", ["in", ["get", "id"], ["literal", []]]);
       map.setFilter("lot-selected-line", ["in", ["get", "id"], ["literal", []]]);
@@ -356,6 +415,8 @@ function selectFeature(feature, zoom = true, additive = false, range = false) {
 
   state.selectedFeature = state.selectedFeatures.includes(feature) ? feature : state.selectedFeatures.at(-1);
   feature = state.selectedFeature;
+  state.modelDimension = null;
+  state.selectedWall = null;
   if (state.ready) {
     const ids = state.selectedFeatures.map((item) => String(item.properties.id));
     map.setFilter("lot-selected-fill", ["in", ["get", "id"], ["literal", ids]]);
@@ -568,6 +629,7 @@ function updateCalculation() {
     return {
       feature: selected,
       values: {
+        lotId: String(selected.properties.id),
         lotArea: featureArea(selected), freeArea: selectedParams.freeArea, floors: selectedFloors,
         floorHeight, authorizedCe: selectedAuthorizedCe, epapEnabled, epapPercent,
         height: selectedHeight, buildableArea: featureArea(selected) * selectedAuthorizedCe,
@@ -777,20 +839,123 @@ function scaleGeometry(geometry, scale, anchor = geometryCenter(geometry)) {
   };
 }
 
+function edgeNormalMeters(a, b, latitude, counterClockwise) {
+  const dx = (b[0] - a[0]) * 111320 * Math.cos((latitude * Math.PI) / 180);
+  const dy = (b[1] - a[1]) * 110540;
+  const length = Math.hypot(dx, dy) || 1;
+  return counterClockwise ? [dy / length, -dx / length] : [-dy / length, dx / length];
+}
+
+function ringSignedAreaMeters(ring) {
+  const center = ring.reduce((sum, point) => [sum[0] + point[0] / ring.length, sum[1] + point[1] / ring.length], [0, 0]);
+  const cosLat = Math.cos((center[1] * Math.PI) / 180);
+  let area = 0;
+  for (let i = 0; i < ring.length - 1; i += 1) {
+    const ax = ring[i][0] * 111320 * cosLat; const ay = ring[i][1] * 110540;
+    const bx = ring[i + 1][0] * 111320 * cosLat; const by = ring[i + 1][1] * 110540;
+    area += ax * by - bx * ay;
+  }
+  return area / 2;
+}
+
+function applyWallOffsets(geometry, offsets = {}) {
+  const transformRing = (ring, polygonIndex, isOuter) => {
+    if (!isOuter || ring.length < 4) return ring.map((point) => [...point]);
+    const points = ring.slice(0, -1); const ccw = ringSignedAreaMeters(ring) > 0;
+    const moved = points.map((point, vertexIndex) => {
+      const prevIndex = (vertexIndex - 1 + points.length) % points.length;
+      const prevOffset = Number(offsets[`${polygonIndex}:${prevIndex}`]) || 0;
+      const nextOffset = Number(offsets[`${polygonIndex}:${vertexIndex}`]) || 0;
+      const prevNormal = edgeNormalMeters(points[prevIndex], point, point[1], ccw);
+      const nextNormal = edgeNormalMeters(point, points[(vertexIndex + 1) % points.length], point[1], ccw);
+      const count = (Math.abs(prevOffset) > 1e-8 ? 1 : 0) + (Math.abs(nextOffset) > 1e-8 ? 1 : 0);
+      const divisor = count || 1;
+      const dx = (prevNormal[0] * prevOffset + nextNormal[0] * nextOffset) / divisor;
+      const dy = (prevNormal[1] * prevOffset + nextNormal[1] * nextOffset) / divisor;
+      return [point[0] + dx / (111320 * Math.cos((point[1] * Math.PI) / 180)), point[1] + dy / 110540];
+    });
+    return [...moved, [...moved[0]]];
+  };
+  const polygons = polygonsFromGeometry(geometry).map((polygon, polygonIndex) => polygon.map((ring, ringIndex) => transformRing(ring, polygonIndex, ringIndex === 0)));
+  return geometry.type === "Polygon" ? { ...geometry, coordinates: polygons[0] } : { ...geometry, coordinates: polygons };
+}
+
+function pointInGeoRing(point, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const a = ring[i]; const b = ring[j];
+    if ((a[1] > point[1]) !== (b[1] > point[1]) && point[0] < ((b[0] - a[0]) * (point[1] - a[1])) / (b[1] - a[1]) + a[0]) inside = !inside;
+  }
+  return inside;
+}
+
+function footprintRespectsLotAndArea(geometry, lotGeometry, maxArea) {
+  const lotPolygons = polygonsFromGeometry(lotGeometry);
+  for (const polygon of polygonsFromGeometry(geometry)) {
+    const ring = polygon[0];
+    for (let index = 0; index < ring.length - 1; index += 1) {
+      if (!lotPolygons.some((lotPolygon) => pointInGeoRing(ring[index], lotPolygon[0]))) return false;
+    }
+  }
+  return featureArea({ geometry, properties: { area_m2: 0 } }) <= maxArea + 0.05;
+}
+
+function constrainWallOffset(model, baseGeometry, edgeKey, currentValue, desiredValue, offsets) {
+  const maxArea = featureArea({ geometry: baseGeometry, properties: { area_m2: 0 } });
+  const valid = (candidate) => {
+    const next = { ...offsets, [edgeKey]: candidate };
+    return footprintRespectsLotAndArea(applyWallOffsets(baseGeometry, next), model.feature.geometry, maxArea);
+  };
+  if (valid(desiredValue)) return desiredValue;
+  let low = 0; let high = 1;
+  for (let i = 0; i < 16; i += 1) {
+    const mid = (low + high) / 2;
+    if (valid(currentValue + (desiredValue - currentValue) * mid)) low = mid;
+    else high = mid;
+  }
+  return currentValue + (desiredValue - currentValue) * low;
+}
+
 function updateMapModel(models) {
   if (!state.ready || !map.getSource("cabida-model")) return;
+  state.modelInputs = models;
   const floors = [];
   const epapFeatures = [];
+  let activeModelMetrics = null;
   for (const { feature, values } of models) {
     const footprintRatio = Math.max(0.05, 1 - values.freeArea / 100);
-    const footprint = scaleGeometry(feature.geometry, Math.sqrt(footprintRatio));
-    for (let index = 0; index < values.floors; index += 1) {
+    const baseFootprint = scaleGeometry(feature.geometry, Math.sqrt(footprintRatio));
+    const savedOffsets = state.wallEdits.get(values.lotId) || {};
+    const validOffsets = {};
+    for (const [edgeKey, rawOffset] of Object.entries(savedOffsets)) {
+      const offset = Number(rawOffset);
+      if (!Number.isFinite(offset)) continue;
+      validOffsets[edgeKey] = constrainWallOffset({ feature, values }, baseFootprint, edgeKey, 0, offset, validOffsets);
+    }
+    if (Object.keys(validOffsets).length) state.wallEdits.set(values.lotId, validOffsets);
+    else state.wallEdits.delete(values.lotId);
+    const footprint = applyWallOffsets(baseFootprint, validOffsets);
+    const normativeHeight = Number(values.height) || values.floors * values.floorHeight;
+    const baseHeight = Math.min(normativeHeight, values.floors * values.floorHeight);
+    const editedHeight = clamp(Number(state.modelEdits.get(values.lotId) ?? baseHeight), 0.5, normativeHeight);
+    const floorCount = Math.ceil(editedHeight / values.floorHeight);
+    const footprintArea = featureArea({ geometry: footprint, properties: { area_m2: 0 } });
+    if (String(state.selectedFeature?.properties.id) === values.lotId) {
+      const measuredFloors = Math.ceil(editedHeight / values.floorHeight);
+      activeModelMetrics = { height: editedHeight, floors: measuredFloors, area: footprintArea * measuredFloors, edited: state.modelEdits.has(values.lotId), maxHeight: normativeHeight };
+    }
+    for (let index = 0; index < floorCount; index += 1) {
       const gap = index ? 0.08 : 0;
+      const floorBase = index * values.floorHeight + gap;
+      const floorTop = Math.min((index + 1) * values.floorHeight, editedHeight);
+      if (floorTop <= floorBase + 0.02) continue;
       floors.push({
         type: "Feature",
         properties: {
-          base: index * values.floorHeight + gap,
-          height: (index + 1) * values.floorHeight,
+          lotId: values.lotId,
+          editable: true,
+          base: floorBase,
+          height: floorTop,
           color: index % 2 ? (values.epapEnabled ? "#00a968" : "#1e805a") : (values.epapEnabled ? "#008f58" : "#176c4c"),
         },
         geometry: footprint,
@@ -804,12 +969,323 @@ function updateMapModel(models) {
   }
   map.getSource("cabida-model").setData({ type: "FeatureCollection", features: floors });
   map.getSource("epap-model").setData({ type: "FeatureCollection", features: epapFeatures });
+  if (activeModelMetrics) {
+    ui.modelHeight.textContent = nf1.format(activeModelMetrics.height);
+    ui.modelFloors.textContent = nf1.format(activeModelMetrics.floors);
+    ui.modelArea.textContent = nf0.format(activeModelMetrics.area);
+    ui.modelDimension.textContent = state.modelDimension?.lotId === String(state.selectedFeature?.properties.id)
+      ? nf1.format(state.modelDimension.value) : "—";
+    ui.modelInteractionHint.textContent = state.pushPullMode
+      ? `${activeModelMetrics.edited ? "Editado" : "Altura inicial"}: ${nf1.format(activeModelMetrics.height)} m · Tope ${nf1.format(activeModelMetrics.maxHeight)} m · Arrastre cara superior o pared`
+      : "Arrastre con clic derecho para girar e inclinar · Rueda para acercar";
+  }
+  renderModelEditor();
+}
+
+function pointInScreenRing(point, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const a = ring[i]; const b = ring[j];
+    if ((a.y > point.y) !== (b.y > point.y) && point.x < ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
+function projectModelPoint(lngLat, altitude) {
+  const ground = map.project(lngLat);
+  const latitude = (lngLat[1] * Math.PI) / 180;
+  const worldPixelsPerMeter = (512 * 2 ** map.getZoom()) / (2 * Math.PI * 6378137 * Math.max(0.01, Math.cos(latitude)));
+  const verticalPixelsPerMeter = worldPixelsPerMeter * Math.sin((map.getPitch() * Math.PI) / 180);
+  return { x: ground.x, y: ground.y - altitude * verticalPixelsPerMeter };
+}
+
+// MapLibre supplies the rendered extrusion hit; projection at its top elevation
+// distinguishes the editable top face from the vertical walls.
+function raycastEditableTopFace(point) {
+  const hits = map.queryRenderedFeatures(point, { layers: ["cabida-model"] });
+  const selectedId = String(state.selectedFeature?.properties.id || "");
+  for (const hit of hits) {
+    if (!hit.properties?.editable || String(hit.properties.lotId) !== selectedId) continue;
+    const polygons = hit.geometry?.type === "Polygon" ? [hit.geometry.coordinates]
+      : hit.geometry?.type === "MultiPolygon" ? hit.geometry.coordinates : [];
+    const altitude = Number(hit.properties.height) || 0;
+    for (const polygon of polygons) {
+      const rings = polygon.map((ring) => ring.map(([lng, lat]) => projectModelPoint([lng, lat], altitude)));
+      if (rings.length && pointInScreenRing(point, rings[0]) && !rings.slice(1).some((ring) => pointInScreenRing(point, ring))) return hit;
+    }
+  }
+  return null;
+}
+
+function raycastEditableWall(point) {
+  const hits = map.queryRenderedFeatures(point, { layers: ["cabida-model"] });
+  const selectedId = String(state.selectedFeature?.properties.id || "");
+  for (const hit of hits) {
+    if (!hit.properties?.editable || String(hit.properties.lotId) !== selectedId) continue;
+    const polygons = hit.geometry?.type === "Polygon" ? [hit.geometry.coordinates]
+      : hit.geometry?.type === "MultiPolygon" ? hit.geometry.coordinates : [];
+    const base = Number(hit.properties.base) || 0; const height = Number(hit.properties.height) || 0;
+    for (let polygonIndex = 0; polygonIndex < polygons.length; polygonIndex += 1) {
+      const ring = polygons[polygonIndex][0];
+      if (!ring || ring.length < 4) continue;
+      const ccw = ringSignedAreaMeters(ring) > 0;
+      for (let edgeIndex = 0; edgeIndex < ring.length - 1; edgeIndex += 1) {
+        const a = ring[edgeIndex]; const b = ring[edgeIndex + 1];
+        const quad = [
+          projectModelPoint(a, base), projectModelPoint(b, base),
+          projectModelPoint(b, height), projectModelPoint(a, height),
+        ];
+        if (!pointInScreenRing(point, [...quad, quad[0]])) continue;
+        const middle = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+        const normal = edgeNormalMeters(a, b, middle[1], ccw);
+        const outside = [middle[0] + normal[0] / (111320 * Math.cos((middle[1] * Math.PI) / 180)), middle[1] + normal[1] / 110540];
+        const edgeScreen = projectModelPoint(outside, (base + height) / 2);
+        const centerScreen = projectModelPoint(middle, (base + height) / 2);
+        const nx = edgeScreen.x - centerScreen.x; const ny = edgeScreen.y - centerScreen.y;
+        const pxPerMeter = Math.hypot(nx, ny);
+        if (pxPerMeter < 0.05) continue;
+        const edgeLength = Math.hypot((b[0] - a[0]) * 111320 * Math.cos((middle[1] * Math.PI) / 180), (b[1] - a[1]) * 110540);
+        return { hit, polygonIndex, edgeIndex, normalScreen: [nx / pxPerMeter, ny / pxPerMeter], pxPerMeter, edgeLength };
+      }
+    }
+  }
+  return null;
+}
+
+function getModelFootprint(model) {
+  const ratio = Math.max(0.05, 1 - model.values.freeArea / 100);
+  const base = scaleGeometry(model.feature.geometry, Math.sqrt(ratio));
+  return applyWallOffsets(base, state.wallEdits.get(model.values.lotId) || {});
+}
+
+function setSelectedFaceOverlay() {
+  const source = map.getSource("pushpull-face");
+  if (!source) return;
+  const selected = state.selectedWall;
+  const model = selected && state.modelInputs.find((item) => String(item.values.lotId) === selected.lotId);
+  if (!model) { source.setData(emptyCollection()); return; }
+  const geometry = getModelFootprint(model);
+  const polygon = polygonsFromGeometry(geometry)[selected.polygonIndex];
+  const ring = polygon?.[0];
+  const a = ring?.[selected.edgeIndex]; const b = ring?.[selected.edgeIndex + 1];
+  if (!a || !b) { source.setData(emptyCollection()); return; }
+  const ccw = ringSignedAreaMeters(ring) > 0;
+  const middleLat = (a[1] + b[1]) / 2;
+  const normal = edgeNormalMeters(a, b, middleLat, ccw);
+  const outside = (point) => [point[0] + normal[0] * 0.12 / (111320 * Math.cos((point[1] * Math.PI) / 180)), point[1] + normal[1] * 0.12 / 110540];
+  const modelHeight = Number(state.modelEdits.get(selected.lotId) ?? Math.min(model.values.height, model.values.floors * model.values.floorHeight));
+  source.setData({ type: "FeatureCollection", features: [{
+    type: "Feature", properties: { base: 0, height: modelHeight, color: "#00b8ff" },
+    geometry: { type: "Polygon", coordinates: [[a, b, outside(b), outside(a), a]] },
+  }] });
+}
+
+function modelMaximumHeight(model) {
+  return Number(model?.values.height) || Number(model?.values.floors) * Number(model?.values.floorHeight) || 0.5;
+}
+
+function modelCurrentHeight(model) {
+  const id = String(model?.values.lotId || "");
+  const baseline = Math.min(modelMaximumHeight(model), Number(model?.values.floors) * Number(model?.values.floorHeight));
+  return clamp(Number(state.modelEdits.get(id) ?? baseline), 0.5, modelMaximumHeight(model));
+}
+
+function beginHeightControlEdit() {
+  const id = String(state.selectedFeature?.properties.id || "");
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === id);
+  if (!model) return;
+  state.pendingHeightControl = { id, before: modelCurrentHeight(model), beforeOverride: state.modelEdits.get(id) };
+}
+
+function applyHeightControlValue(value) {
+  const id = String(state.selectedFeature?.properties.id || "");
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === id);
+  if (!model) return;
+  state.modelEdits.set(id, clamp(Number(value) || 0.5, 0.5, modelMaximumHeight(model)));
+  updateCalculation();
+}
+
+function commitHeightControlEdit() {
+  const pending = state.pendingHeightControl; state.pendingHeightControl = null;
+  if (!pending) return;
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === pending.id);
+  const after = model ? modelCurrentHeight(model) : pending.before;
+  if (Math.abs(after - pending.before) < 0.02) return;
+  state.modelEditUndo.push({ type: "height", id: pending.id, before: pending.beforeOverride, after: state.modelEdits.get(pending.id) });
+  state.modelEditRedo = []; persistModelEdits(); syncModelEditHistoryButtons();
+}
+
+function changeHeightControl(event) {
+  if (!state.pendingHeightControl) beginHeightControlEdit();
+  applyHeightControlValue(event.currentTarget.value);
+}
+
+function changeNumericHeightControl(event) {
+  changeHeightControl(event);
+  commitHeightControlEdit();
+}
+
+function nudgeModelHeight(delta) {
+  beginHeightControlEdit();
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === state.pendingHeightControl?.id);
+  if (!model) return;
+  applyHeightControlValue(modelCurrentHeight(model) + delta);
+  commitHeightControlEdit();
+}
+
+function renderModelEditor() {
+  if (!ui.modelEditor) return;
+  const id = String(state.selectedFeature?.properties.id || "");
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === id);
+  ui.modelEditorLot.textContent = state.selectedFeature
+    ? `LOTE ${state.selectedFeature.properties.cod_lote || id}` : "Selecciona un lote";
+  const maxHeight = model ? modelMaximumHeight(model) : 30;
+  const height = model ? modelCurrentHeight(model) : 0.5;
+  ui.modelHeightInput.disabled = !model; ui.modelHeightRange.disabled = !model;
+  ui.modelHeightDown.disabled = !model || height <= 0.5; ui.modelHeightUp.disabled = !model || height >= maxHeight - 0.001;
+  ui.modelHeightInput.max = String(maxHeight); ui.modelHeightRange.max = String(maxHeight);
+  ui.modelHeightInput.value = model ? height.toFixed(1) : "0";
+  ui.modelHeightRange.value = String(height);
+  ui.modelHeightLimit.textContent = `Tope ${nf1.format(maxHeight)} m`;
+  const edges = [];
+  if (model) {
+    const geometry = getModelFootprint(model);
+    polygonsFromGeometry(geometry).forEach((polygon, polygonIndex) => {
+      const ring = polygon[0];
+      for (let edgeIndex = 0; ring && edgeIndex < ring.length - 1; edgeIndex += 1) {
+        const a = ring[edgeIndex]; const b = ring[edgeIndex + 1];
+        const midLat = (a[1] + b[1]) / 2;
+        const length = Math.hypot((b[0] - a[0]) * 111320 * Math.cos((midLat * Math.PI) / 180), (b[1] - a[1]) * 110540);
+        edges.push({ polygonIndex, edgeIndex, key: `${polygonIndex}:${edgeIndex}`, length });
+      }
+    });
+  }
+  ui.modelFaceCount.textContent = `${edges.length} caras`;
+  ui.modelFaceList.innerHTML = edges.map((edge, index) => {
+    const active = state.selectedWall?.lotId === id && state.selectedWall.edgeKey === edge.key;
+    const offset = Number(state.wallEdits.get(id)?.[edge.key]) || 0;
+    return `<button type="button" class="model-face-option${active ? " is-selected" : ""}" data-face-key="${edge.key}" aria-pressed="${active}"><strong>${`Cara ${String(index + 1).padStart(2, "0")}`}</strong><span>${nf1.format(edge.length)} m · ${offset >= 0 ? "+" : ""}${nf1.format(offset)} m</span></button>`;
+  }).join("");
+  ui.modelFaceList.querySelectorAll("[data-face-key]").forEach((button) => button.addEventListener("click", () => {
+    const [polygonIndex, edgeIndex] = button.dataset.faceKey.split(":").map(Number);
+    const edge = edges.find((item) => item.key === button.dataset.faceKey);
+    state.selectedWall = { lotId: id, edgeKey: button.dataset.faceKey, polygonIndex, edgeIndex };
+    state.modelDimension = edge ? { lotId: id, value: edge.length } : null;
+    renderModelEditor(); setSelectedFaceOverlay();
+    if (edge) ui.modelDimension.textContent = nf1.format(edge.length);
+  }));
+  const selectedEdge = edges.find((edge) => state.selectedWall?.lotId === id && state.selectedWall.edgeKey === edge.key);
+  ui.modelFaceControls.classList.toggle("is-hidden", !selectedEdge);
+  if (selectedEdge) {
+    const offset = Number(state.wallEdits.get(id)?.[selectedEdge.key]) || 0;
+    ui.modelSelectedFace.textContent = `Cara ${String(edges.indexOf(selectedEdge) + 1).padStart(2, "0")}`;
+    ui.modelSelectedFaceLength.textContent = `${nf1.format(selectedEdge.length)} m`;
+    ui.modelFaceOffset.value = String(offset); ui.modelFaceOffsetNumber.value = String(Number(offset.toFixed(1)));
+    ui.modelFaceLimitHint.textContent = "El deslizador respeta el área ocupable y el contorno del lote.";
+  }
+  setSelectedFaceOverlay();
+}
+
+function applyWallOffsetEdit(id, edgeKey, desiredValue) {
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === id);
+  if (!model) return null;
+  const offsets = { ...(state.wallEdits.get(id) || {}) };
+  const currentValue = Number(offsets[edgeKey]) || 0;
+  const ratio = Math.max(0.05, 1 - model.values.freeArea / 100);
+  const base = scaleGeometry(model.feature.geometry, Math.sqrt(ratio));
+  const desired = clamp(Number(desiredValue) || 0, -25, 25);
+  const next = constrainWallOffset(model, base, edgeKey, currentValue, desired, offsets);
+  if (Math.abs(next) < 0.005) delete offsets[edgeKey]; else offsets[edgeKey] = next;
+  if (Object.keys(offsets).length) state.wallEdits.set(id, offsets); else state.wallEdits.delete(id);
+  updateCalculation();
+  return next;
+}
+
+function beginWallControlEdit() {
+  if (!state.selectedWall) return;
+  const offsets = state.wallEdits.get(state.selectedWall.lotId) || {};
+  state.pendingWallControl = { ...state.selectedWall, before: Number(offsets[state.selectedWall.edgeKey]) || 0 };
+}
+
+function changeWallControl(event) {
+  if (!state.selectedWall) return;
+  if (!state.pendingWallControl) beginWallControlEdit();
+  const next = applyWallOffsetEdit(state.selectedWall.lotId, state.selectedWall.edgeKey, event.currentTarget.value);
+  if (next != null) event.currentTarget.value = String(Number(next.toFixed(1)));
+}
+
+function commitWallControlEdit() {
+  const pending = state.pendingWallControl; state.pendingWallControl = null;
+  if (!pending) return;
+  const after = Number(state.wallEdits.get(pending.lotId)?.[pending.edgeKey]) || 0;
+  if (Math.abs(after - pending.before) < 0.02) return;
+  state.modelEditUndo.push({ type: "wall", id: pending.lotId, edgeKey: pending.edgeKey, before: pending.before || null, after });
+  state.modelEditRedo = []; persistModelEdits(); syncModelEditHistoryButtons();
+}
+
+function changeNumericWallControl(event) {
+  changeWallControl(event);
+  commitWallControlEdit();
+}
+
+function syncModelEditHistoryButtons() {
+  ui.undoModelEdit.disabled = state.modelEditUndo.length === 0;
+  ui.redoModelEdit.disabled = state.modelEditRedo.length === 0;
+}
+
+function applyModelEdit(entry, direction) {
+  const value = direction === "undo" ? entry.before : entry.after;
+  if (entry.type === "wall") {
+    const offsets = { ...(state.wallEdits.get(entry.id) || {}) };
+    if (value == null) delete offsets[entry.edgeKey]; else offsets[entry.edgeKey] = value;
+    if (Object.keys(offsets).length) state.wallEdits.set(entry.id, offsets); else state.wallEdits.delete(entry.id);
+  } else if (value == null) state.modelEdits.delete(entry.id);
+  else state.modelEdits.set(entry.id, value);
+  updateMapModel(state.modelInputs);
+}
+
+function undoModelEdit() {
+  const entry = state.modelEditUndo.pop();
+  if (!entry) return;
+  applyModelEdit(entry, "undo"); state.modelEditRedo.push(entry); persistModelEdits(); syncModelEditHistoryButtons();
+}
+
+function redoModelEdit() {
+  const entry = state.modelEditRedo.pop();
+  if (!entry) return;
+  applyModelEdit(entry, "redo"); state.modelEditUndo.push(entry); persistModelEdits(); syncModelEditHistoryButtons();
+}
+
+function finishModelDrag() {
+  const drag = state.activeModelDrag;
+  if (!drag) return;
+  state.activeModelDrag = null;
+  if (drag.dragPanEnabled) map.dragPan.enable();
+  if (drag.boxZoomEnabled) map.boxZoom.enable();
+  if (drag.rotateEnabled) map.dragRotate.enable();
+  if (drag.moved) {
+    state.suppressNextMapClick = true;
+    window.setTimeout(() => { state.suppressNextMapClick = false; }, 0);
+  }
+  const after = drag.type === "wall" ? Number(state.wallEdits.get(drag.id)?.[drag.edgeKey] || 0) : state.modelEdits.get(drag.id);
+  if (Number.isFinite(after) && Math.abs(after - drag.startValue) >= 0.02) {
+    state.modelEditUndo.push({ type: drag.type, id: drag.id, edgeKey: drag.edgeKey, before: drag.beforeOverride, after });
+    state.modelEditRedo = [];
+  } else if (drag.beforeOverride == null) {
+    if (drag.type === "wall") {
+      const offsets = { ...(state.wallEdits.get(drag.id) || {}) }; delete offsets[drag.edgeKey];
+      if (Object.keys(offsets).length) state.wallEdits.set(drag.id, offsets); else state.wallEdits.delete(drag.id);
+    } else state.modelEdits.delete(drag.id);
+  }
+  persistModelEdits();
+  syncModelEditHistoryButtons();
 }
 
 function clearMapModel() {
   if (!state.ready) return;
   map.getSource("cabida-model")?.setData(emptyCollection());
   map.getSource("epap-model")?.setData(emptyCollection());
+  state.modelInputs = [];
 }
 
 function geometryBounds(geometry) {
@@ -870,6 +1346,137 @@ ui.tilt3d.addEventListener("click", () => {
   else map.easeTo({ pitch: 60, bearing: -24, duration: 650 });
 });
 ui.flat2d.addEventListener("click", () => map.easeTo({ pitch: 0, bearing: 0, duration: 650 }));
+
+ui.pushPull.addEventListener("click", () => {
+  if (!state.selectedFeature) {
+    ui.modelInteractionHint.textContent = "Seleccione un lote antes de activar Push/Pull.";
+    ui.mapModelHud.classList.remove("is-hidden");
+    return;
+  }
+  state.pushPullMode = !state.pushPullMode;
+  ui.pushPull.classList.toggle("is-active", state.pushPullMode);
+  ui.pushPull.setAttribute("aria-pressed", String(state.pushPullMode));
+  document.querySelector(".map-shell").classList.toggle("push-pull-active", state.pushPullMode);
+  ui.modelEditor.classList.toggle("is-hidden", !state.pushPullMode);
+  if (state.pushPullMode) {
+    map.easeTo({ pitch: Math.max(map.getPitch(), 55), duration: 450 });
+    ui.modelInteractionHint.textContent = "Elija una cara en el panel y ajuste su cota, o arrástrela directamente.";
+  }
+  updateMapModel(state.modelInputs);
+});
+ui.closeModelEditor.addEventListener("click", () => {
+  state.pushPullMode = false; state.selectedWall = null; state.modelDimension = null;
+  ui.pushPull.classList.remove("is-active"); ui.pushPull.setAttribute("aria-pressed", "false");
+  document.querySelector(".map-shell").classList.remove("push-pull-active");
+  ui.modelEditor.classList.add("is-hidden"); setSelectedFaceOverlay(); updateMapModel(state.modelInputs);
+});
+ui.undoModelEdit.addEventListener("click", undoModelEdit);
+ui.redoModelEdit.addEventListener("click", redoModelEdit);
+ui.modelFaceOffset.addEventListener("pointerdown", beginWallControlEdit);
+ui.modelFaceOffset.addEventListener("focus", beginWallControlEdit);
+ui.modelFaceOffsetNumber.addEventListener("focus", beginWallControlEdit);
+ui.modelFaceOffset.addEventListener("input", changeWallControl);
+ui.modelFaceOffset.addEventListener("change", commitWallControlEdit);
+ui.modelFaceOffsetNumber.addEventListener("change", changeNumericWallControl);
+ui.modelHeightRange.addEventListener("pointerdown", beginHeightControlEdit);
+ui.modelHeightRange.addEventListener("focus", beginHeightControlEdit);
+ui.modelHeightRange.addEventListener("input", changeHeightControl);
+ui.modelHeightRange.addEventListener("change", commitHeightControlEdit);
+ui.modelHeightInput.addEventListener("focus", beginHeightControlEdit);
+ui.modelHeightInput.addEventListener("change", changeNumericHeightControl);
+ui.modelHeightDown.addEventListener("click", () => nudgeModelHeight(-0.1));
+ui.modelHeightUp.addEventListener("click", () => nudgeModelHeight(0.1));
+
+map.on("mousedown", (event) => {
+  if (!state.pushPullMode || !state.selectedFeature || event.originalEvent?.button !== 0) return;
+  const wall = raycastEditableWall(event.point);
+  if (wall) {
+    const id = String(wall.hit.properties.lotId);
+    const edgeKey = `${wall.polygonIndex}:${wall.edgeIndex}`;
+    const offsets = state.wallEdits.get(id) || {};
+    const currentValue = Number(offsets[edgeKey]) || 0;
+    state.modelDimension = { lotId: id, value: wall.edgeLength };
+    state.selectedWall = { lotId: id, edgeKey, polygonIndex: wall.polygonIndex, edgeIndex: wall.edgeIndex };
+    state.activeModelDrag = {
+      type: "wall", id, edgeKey, startX: event.point.x, startY: event.point.y,
+      startValue: currentValue, beforeOverride: offsets[edgeKey], normalScreen: wall.normalScreen,
+      pxPerMeter: wall.pxPerMeter, edgeLength: wall.edgeLength, polygonIndex: wall.polygonIndex,
+      dragPanEnabled: map.dragPan.isEnabled(), boxZoomEnabled: map.boxZoom.isEnabled(), rotateEnabled: map.dragRotate.isEnabled(), moved: false,
+    };
+    event.originalEvent.preventDefault();
+    map.dragPan.disable(); map.boxZoom.disable(); map.dragRotate.disable();
+    map.getCanvas().style.cursor = "move";
+    renderModelEditor();
+    return;
+  }
+  const hit = raycastEditableTopFace(event.point);
+  if (!hit) return;
+  const id = String(hit.properties.lotId);
+  const height = Number(hit.properties.height);
+  const center = geometryCenter(state.selectedFeature.geometry);
+  const pxPerMeter = Math.abs(projectModelPoint(center, height + 1).y - projectModelPoint(center, height).y);
+  if (!Number.isFinite(pxPerMeter) || pxPerMeter < 0.05) return;
+  event.originalEvent.preventDefault();
+  state.activeModelDrag = {
+    type: "height", id, startY: event.point.y, startHeight: height, startValue: height,
+    beforeOverride: state.modelEdits.get(id), pxPerMeter,
+    dragPanEnabled: map.dragPan.isEnabled(), boxZoomEnabled: map.boxZoom.isEnabled(), rotateEnabled: map.dragRotate.isEnabled(),
+    moved: false,
+  };
+  map.dragPan.disable(); map.boxZoom.disable(); map.dragRotate.disable();
+  map.getCanvas().style.cursor = "ns-resize";
+});
+
+map.on("mousemove", (event) => {
+  const drag = state.activeModelDrag;
+  if (!drag) return;
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === drag.id);
+  if (!model) return;
+  if (drag.type === "wall") {
+    const dx = event.point.x - drag.startX; const dy = event.point.y - drag.startY;
+    const deltaPixels = dx * drag.normalScreen[0] + dy * drag.normalScreen[1];
+    if (Math.abs(deltaPixels) > 2) drag.moved = true;
+    const footprintRatio = Math.max(0.05, 1 - model.values.freeArea / 100);
+    const baseFootprint = scaleGeometry(model.feature.geometry, Math.sqrt(footprintRatio));
+    const offsets = { ...(state.wallEdits.get(drag.id) || {}) };
+    const desired = clamp(Math.round((drag.startValue + deltaPixels / drag.pxPerMeter) * 10) / 10, -25, 25);
+    const nextValue = constrainWallOffset(model, baseFootprint, drag.edgeKey, drag.startValue, desired, offsets);
+    offsets[drag.edgeKey] = nextValue;
+    state.wallEdits.set(drag.id, offsets);
+    state.modelDimension = { lotId: drag.id, value: drag.edgeLength };
+    updateCalculation();
+    return;
+  }
+  const deltaPixels = drag.startY - event.point.y;
+  if (Math.abs(deltaPixels) > 2) drag.moved = true;
+  const maxHeight = Number(model.values.height) || drag.startHeight;
+  const height = clamp(drag.startHeight + deltaPixels / drag.pxPerMeter, 0.5, maxHeight);
+  state.modelEdits.set(drag.id, height);
+  updateCalculation();
+});
+
+map.on("mouseup", finishModelDrag);
+window.addEventListener("mouseup", finishModelDrag);
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.pushPullMode) {
+    finishModelDrag();
+    state.pushPullMode = false;
+    ui.pushPull.classList.remove("is-active");
+    ui.pushPull.setAttribute("aria-pressed", "false");
+    document.querySelector(".map-shell").classList.remove("push-pull-active");
+    ui.modelEditor.classList.add("is-hidden"); state.selectedWall = null; state.modelDimension = null; setSelectedFaceOverlay();
+    updateMapModel(state.modelInputs);
+    return;
+  }
+  if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+  const target = event.target;
+  if (target instanceof HTMLElement && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
+  if (event.key.toLowerCase() === "z") {
+    event.preventDefault(); event.shiftKey ? redoModelEdit() : undoModelEdit();
+  } else if (event.key.toLowerCase() === "y") {
+    event.preventDefault(); redoModelEdit();
+  }
+});
 
 ui.opacity.addEventListener("input", () => {
   state.fillOpacity = Number(ui.opacity.value) / 100;

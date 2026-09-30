@@ -55,6 +55,9 @@
           <button id="homeButton" type="button" title="Ver todo San Borja" aria-label="Ver todo San Borja">⌂</button>
           <button id="tilt3dButton" type="button" title="Inclinar mapa y ver cabida 3D" aria-label="Activar vista 3D">3D</button>
           <button id="flat2dButton" type="button" title="Volver a vista superior" aria-label="Activar vista 2D">2D</button>
+          <button id="pushPullButton" type="button" title="Activar Push/Pull: arrastre la cara superior del volumen" aria-label="Activar Push/Pull">↕</button>
+          <button id="undoModelEditButton" type="button" title="Deshacer modificación 3D" aria-label="Deshacer modificación 3D" disabled>↶</button>
+          <button id="redoModelEditButton" type="button" title="Rehacer modificación 3D" aria-label="Rehacer modificación 3D" disabled>↷</button>
           <button id="layersButton" type="button" title="Capas y leyenda" aria-label="Abrir capas y leyenda">◫</button>
           <button id="togglePanelButton" type="button" title="Ficha técnica" aria-label="Abrir ficha técnica">▤</button>
         </div>
@@ -65,9 +68,34 @@
             <span><b id="modelFloors">—</b> pisos</span>
             <span><b id="modelHeight">—</b> m de altura</span>
             <span><b id="modelArea">—</b> m² techados</span>
+            <span><b id="modelDimension">—</b> m de cara</span>
           </div>
-          <small>Arrastre con clic derecho para girar e inclinar · Rueda para acercar</small>
+          <small id="modelInteractionHint">Arrastre con clic derecho para girar e inclinar · Rueda para acercar</small>
         </div>
+
+        <aside class="model-editor is-hidden" id="modelEditor" aria-label="Editor del volumen 3D">
+          <div class="model-editor-heading">
+            <div><span class="eyebrow">Edición del volumen</span><h2>Push / Pull</h2></div>
+            <button id="closeModelEditor" type="button" aria-label="Cerrar editor">×</button>
+          </div>
+          <div class="model-editor-lot" id="modelEditorLot">Selecciona un lote</div>
+          <p class="model-editor-help">Elige una cara para moverla. El signo negativo la lleva hacia el interior; el positivo, hacia afuera hasta donde permiten los parámetros del lote.</p>
+          <section class="model-height-controls">
+            <div class="model-editor-section-title"><strong>Altura del volumen</strong><span id="modelHeightLimit">Tope — m</span></div>
+            <div class="model-height-value-row"><button type="button" id="modelHeightDown" aria-label="Bajar altura 0,1 metros">−</button><input id="modelHeightInput" type="number" min="0.5" step="0.1" value="0" aria-label="Altura del modelo en metros" /><span>m</span><button type="button" id="modelHeightUp" aria-label="Subir altura 0,1 metros">+</button></div>
+            <input id="modelHeightRange" type="range" min="0.5" max="30" step="0.1" value="0" aria-label="Ajustar altura del modelo" />
+            <small>Usa − / + para cambios finos. El máximo normativo se aplica automáticamente.</small>
+          </section>
+          <div class="model-editor-section-title"><strong>Caras del volumen</strong><span id="modelFaceCount">0</span></div>
+          <div class="model-face-list" id="modelFaceList"></div>
+          <section class="model-face-controls is-hidden" id="modelFaceControls">
+            <div class="model-face-selected"><strong id="modelSelectedFace">Cara —</strong><span id="modelSelectedFaceLength">— m</span></div>
+            <label for="modelFaceOffset">Desplazamiento de la cara</label>
+            <input id="modelFaceOffset" type="range" min="-25" max="25" step="0.1" value="0" />
+            <div class="model-offset-row"><span>Interior</span><input id="modelFaceOffsetNumber" type="number" min="-25" max="25" step="0.1" value="0" /><span>Exterior</span></div>
+            <small id="modelFaceLimitHint">Área y límites del lote controlan el movimiento.</small>
+          </section>
+        </aside>
 
         <aside id="layersPanel" class="layers-panel is-hidden" aria-label="Capas y leyenda">
           <div class="panel-heading">
@@ -273,6 +301,7 @@
             <li>Busque por código o CUC, o seleccione un lote directamente en el mapa.</li>
             <li>Revise su zonificación y el frente vial normativo detectado.</li>
             <li>Ajuste las condiciones del proyecto y explore la cabida en 3D.</li>
+            <li>En 3D, active ↕ para seleccionar caras, ajustar su desplazamiento y consultar sus cotas.</li>
           </ul>
         </section>
         <button class="primary-button" id="enterButton" type="button">Ingresar al visor</button>
