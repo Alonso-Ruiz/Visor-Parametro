@@ -74,6 +74,9 @@ const ui = {
   modelInteractionHint: $("modelInteractionHint"),
   modelDimension: $("modelDimension"),
   modelEditor: $("modelEditor"),
+  modelEditorBackdrop: $("modelEditorBackdrop"),
+  modelEditorPreview: document.querySelector(".model-editor-preview"),
+  mapCanvas: $("map"),
   closeModelEditor: $("closeModelEditor"),
   modelEditorLot: $("modelEditorLot"),
   modelFaceCount: $("modelFaceCount"),
@@ -84,11 +87,16 @@ const ui = {
   modelFaceOffset: $("modelFaceOffset"),
   modelFaceOffsetNumber: $("modelFaceOffsetNumber"),
   modelFaceLimitHint: $("modelFaceLimitHint"),
-  modelHeightInput: $("modelHeightInput"),
-  modelHeightRange: $("modelHeightRange"),
+  modelEditorCurrentHeight: $("modelEditorCurrentHeight"),
   modelHeightLimit: $("modelHeightLimit"),
-  modelHeightDown: $("modelHeightDown"),
-  modelHeightUp: $("modelHeightUp"),
+  modelFloorDown: $("modelFloorDown"),
+  modelFloorUp: $("modelFloorUp"),
+  modelFloorCount: $("modelFloorCount"),
+  modelFootprintArea: $("modelFootprintArea"),
+  modelRoofedArea: $("modelRoofedArea"),
+  modelFreeArea: $("modelFreeArea"),
+  modelRulesSummary: $("modelRulesSummary"),
+  restoreLotModel: $("restoreLotModelButton"),
   mapModelHud: $("mapModelHud"),
   mapLotCode: $("mapLotCode"),
   modelSelectionLabel: $("modelSelectionLabel"),
@@ -121,6 +129,9 @@ const state = {
   currentUse: "multifamiliar",
   lastModel: null,
   pushPullMode: false,
+  modelEditorOpen: false,
+  modelPreviewActive: false,
+  modelPreviewLayerVisibility: null,
   modelEdits: loadSavedModelEdits(),
   wallEdits: loadSavedWallEdits(),
   modelEditUndo: [],
@@ -152,6 +163,7 @@ const map = new maplibregl.Map({
         type: "raster",
         tiles: ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
         tileSize: 256,
+        maxzoom: 19,
         attribution: "Tiles © Esri",
       },
     },
@@ -399,6 +411,7 @@ function selectFeature(feature, zoom = true, additive = false, range = false) {
   if (!state.selectedFeatures.length) {
     state.selectedFeature = null;
     state.selectedWall = null;
+    state.modelEditorOpen = false;
     renderModelEditor();
     if (state.ready) {
       map.setFilter("lot-selected-fill", ["in", ["get", "id"], ["literal", []]]);
@@ -414,6 +427,8 @@ function selectFeature(feature, zoom = true, additive = false, range = false) {
   }
 
   state.selectedFeature = state.selectedFeatures.includes(feature) ? feature : state.selectedFeatures.at(-1);
+  state.modelEditorOpen = state.selectedFeatures.length === 1;
+  state.pushPullMode = state.selectedFeatures.length === 1;
   feature = state.selectedFeature;
   state.modelDimension = null;
   state.selectedWall = null;
@@ -434,9 +449,13 @@ function selectFeature(feature, zoom = true, additive = false, range = false) {
     ? `Cabida sobre ${nf0.format(state.selectedFeatures.length)} lotes`
     : "Cabida sobre el lote";
   ui.mapModelHud.classList.remove("is-hidden");
+  ui.pushPull.classList.toggle("is-active", state.pushPullMode);
+  ui.pushPull.setAttribute("aria-pressed", String(state.pushPullMode));
+  document.querySelector(".map-shell").classList.toggle("push-pull-active", state.pushPullMode);
   ui.detailEmpty.classList.add("is-hidden");
   ui.detailContent.classList.remove("is-hidden");
-  ui.detailPanel.classList.add("is-open");
+  if (window.matchMedia("(max-width: 760px)").matches) ui.detailPanel.classList.remove("is-open");
+  else ui.detailPanel.classList.add("is-open");
   ui.print.disabled = false;
   ui.printDetail.disabled = false;
   configureUses(props.zona);
@@ -631,7 +650,8 @@ function updateCalculation() {
       values: {
         lotId: String(selected.properties.id),
         lotArea: featureArea(selected), freeArea: selectedParams.freeArea, floors: selectedFloors,
-        floorHeight, authorizedCe: selectedAuthorizedCe, epapEnabled, epapPercent,
+        floorHeight, authorizedCe: selectedAuthorizedCe, ceBase: selectedParams.ceBase, ceMax: selectedParams.ceMax,
+        epapEnabled, epapPercent,
         height: selectedHeight, buildableArea: featureArea(selected) * selectedAuthorizedCe,
       },
     };
@@ -935,14 +955,20 @@ function updateMapModel(models) {
     if (Object.keys(validOffsets).length) state.wallEdits.set(values.lotId, validOffsets);
     else state.wallEdits.delete(values.lotId);
     const footprint = applyWallOffsets(baseFootprint, validOffsets);
-    const normativeHeight = Number(values.height) || values.floors * values.floorHeight;
-    const baseHeight = Math.min(normativeHeight, values.floors * values.floorHeight);
-    const editedHeight = clamp(Number(state.modelEdits.get(values.lotId) ?? baseHeight), 0.5, normativeHeight);
-    const floorCount = Math.ceil(editedHeight / values.floorHeight);
     const footprintArea = featureArea({ geometry: footprint, properties: { area_m2: 0 } });
+    const normativeHeight = Number(values.height) || values.floors * values.floorHeight;
+    const ceFloorLimit = Math.max(1, Math.floor((values.lotArea * values.authorizedCe) / Math.max(footprintArea, 0.01) + 1e-7));
+    const regulatoryFloorLimit = Math.max(1, Math.floor(normativeHeight / values.floorHeight + 1e-7));
+    const maxAllowedFloors = Math.min(ceFloorLimit, regulatoryFloorLimit);
+    const maxAllowedHeight = Math.min(normativeHeight, maxAllowedFloors * values.floorHeight);
+    const baseHeight = Math.min(maxAllowedHeight, values.floors * values.floorHeight);
+    const requestedHeight = Number(state.modelEdits.get(values.lotId) ?? baseHeight);
+    const requestedFloors = Math.max(1, Math.round(requestedHeight / values.floorHeight));
+    const editedHeight = clamp(requestedFloors * values.floorHeight, 0.5, maxAllowedHeight);
+    const floorCount = Math.ceil(editedHeight / values.floorHeight);
     if (String(state.selectedFeature?.properties.id) === values.lotId) {
       const measuredFloors = Math.ceil(editedHeight / values.floorHeight);
-      activeModelMetrics = { height: editedHeight, floors: measuredFloors, area: footprintArea * measuredFloors, edited: state.modelEdits.has(values.lotId), maxHeight: normativeHeight };
+      activeModelMetrics = { height: editedHeight, floors: measuredFloors, area: footprintArea * measuredFloors, footprintArea, freeArea: values.freeArea, authorizedCe: values.authorizedCe, ceMax: values.ceMax, ceBase: values.ceBase, edited: state.modelEdits.has(values.lotId), maxHeight: maxAllowedHeight, maxFloors: maxAllowedFloors };
     }
     for (let index = 0; index < floorCount; index += 1) {
       const gap = index ? 0.08 : 0;
@@ -997,24 +1023,6 @@ function projectModelPoint(lngLat, altitude) {
   const worldPixelsPerMeter = (512 * 2 ** map.getZoom()) / (2 * Math.PI * 6378137 * Math.max(0.01, Math.cos(latitude)));
   const verticalPixelsPerMeter = worldPixelsPerMeter * Math.sin((map.getPitch() * Math.PI) / 180);
   return { x: ground.x, y: ground.y - altitude * verticalPixelsPerMeter };
-}
-
-// MapLibre supplies the rendered extrusion hit; projection at its top elevation
-// distinguishes the editable top face from the vertical walls.
-function raycastEditableTopFace(point) {
-  const hits = map.queryRenderedFeatures(point, { layers: ["cabida-model"] });
-  const selectedId = String(state.selectedFeature?.properties.id || "");
-  for (const hit of hits) {
-    if (!hit.properties?.editable || String(hit.properties.lotId) !== selectedId) continue;
-    const polygons = hit.geometry?.type === "Polygon" ? [hit.geometry.coordinates]
-      : hit.geometry?.type === "MultiPolygon" ? hit.geometry.coordinates : [];
-    const altitude = Number(hit.properties.height) || 0;
-    for (const polygon of polygons) {
-      const rings = polygon.map((ring) => ring.map(([lng, lat]) => projectModelPoint([lng, lat], altitude)));
-      if (rings.length && pointInScreenRing(point, rings[0]) && !rings.slice(1).some((ring) => pointInScreenRing(point, ring))) return hit;
-    }
-  }
-  return null;
 }
 
 function raycastEditableWall(point) {
@@ -1081,13 +1089,24 @@ function setSelectedFaceOverlay() {
 }
 
 function modelMaximumHeight(model) {
-  return Number(model?.values.height) || Number(model?.values.floors) * Number(model?.values.floorHeight) || 0.5;
+  if (!model) return 0.5;
+  const normativeHeight = Number(model.values.height) || Number(model.values.floors) * Number(model.values.floorHeight);
+  const footprintArea = featureArea({ geometry: getModelFootprint(model), properties: { area_m2: 0 } });
+  const ceFloors = Math.floor((model.values.lotArea * model.values.authorizedCe) / Math.max(footprintArea, 0.01) + 1e-7);
+  const heightFloors = Math.floor(normativeHeight / model.values.floorHeight + 1e-7);
+  return Math.max(0.5, Math.min(normativeHeight, Math.max(1, Math.min(ceFloors, heightFloors)) * model.values.floorHeight));
+}
+
+function modelMaximumFloors(model) {
+  return Math.max(1, Math.floor(modelMaximumHeight(model) / Number(model.values.floorHeight) + 1e-7));
 }
 
 function modelCurrentHeight(model) {
   const id = String(model?.values.lotId || "");
-  const baseline = Math.min(modelMaximumHeight(model), Number(model?.values.floors) * Number(model?.values.floorHeight));
-  return clamp(Number(state.modelEdits.get(id) ?? baseline), 0.5, modelMaximumHeight(model));
+  const floorHeight = Number(model?.values.floorHeight) || 3;
+  const baseline = Math.min(modelMaximumHeight(model), Number(model?.values.floors) * floorHeight);
+  const height = Number(state.modelEdits.get(id) ?? baseline);
+  return clamp(Math.round(height / floorHeight) * floorHeight, 0.5, modelMaximumHeight(model));
 }
 
 function beginHeightControlEdit() {
@@ -1115,38 +1134,84 @@ function commitHeightControlEdit() {
   state.modelEditRedo = []; persistModelEdits(); syncModelEditHistoryButtons();
 }
 
-function changeHeightControl(event) {
-  if (!state.pendingHeightControl) beginHeightControlEdit();
-  applyHeightControlValue(event.currentTarget.value);
-}
-
-function changeNumericHeightControl(event) {
-  changeHeightControl(event);
-  commitHeightControlEdit();
-}
-
-function nudgeModelHeight(delta) {
-  beginHeightControlEdit();
-  const model = state.modelInputs.find((item) => String(item.values.lotId) === state.pendingHeightControl?.id);
+function setModelFloorCount(delta) {
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === String(state.selectedFeature?.properties.id || ""));
   if (!model) return;
-  applyHeightControlValue(modelCurrentHeight(model) + delta);
+  const current = Math.ceil(modelCurrentHeight(model) / model.values.floorHeight);
+  const next = clamp(current + delta, 1, modelMaximumFloors(model));
+  if (next === current) return;
+  beginHeightControlEdit();
+  applyHeightControlValue(next * model.values.floorHeight);
   commitHeightControlEdit();
+}
+
+function setModelPreviewActive(active) {
+  if (active === state.modelPreviewActive) return;
+  const mapShell = document.querySelector(".map-shell");
+  if (active) {
+    if (!state.ready || !ui.modelEditorPreview || !ui.mapCanvas) return;
+    state.modelPreviewLayerVisibility = new Map();
+    const previewLayers = new Set(["lot-selected-fill", "lot-selected-line", "cabida-model", "epap-model", "pushpull-face"]);
+    for (const layer of map.getStyle()?.layers || []) {
+      if (!map.getLayer(layer.id)) continue;
+      state.modelPreviewLayerVisibility.set(layer.id, map.getLayoutProperty(layer.id, "visibility") || "visible");
+      map.setLayoutProperty(layer.id, "visibility", previewLayers.has(layer.id) ? "visible" : "none");
+    }
+    ui.modelEditorPreview.append(ui.mapCanvas);
+    mapShell.classList.add("is-model-preview");
+    state.modelPreviewActive = true;
+    requestAnimationFrame(() => {
+      if (!state.modelPreviewActive) return;
+      map.resize();
+      if (state.selectedFeature) {
+        const bounds = geometryBounds(state.selectedFeature.geometry);
+        map.fitBounds([[bounds[0], bounds[1]], [bounds[2], bounds[3]]], {
+          padding: { top: 34, bottom: 38, left: 70, right: 70 }, maxZoom: 19.2,
+          pitch: 55, bearing: -18, duration: 550,
+        });
+      }
+    });
+    return;
+  }
+
+  if (ui.mapCanvas?.parentElement !== mapShell) mapShell.insertBefore(ui.mapCanvas, mapShell.firstElementChild);
+  mapShell.classList.remove("is-model-preview");
+  for (const [layerId, visibility] of state.modelPreviewLayerVisibility || []) {
+    if (map.getLayer(layerId)) map.setLayoutProperty(layerId, "visibility", visibility);
+  }
+  state.modelPreviewLayerVisibility = null;
+  state.modelPreviewActive = false;
+  requestAnimationFrame(() => map.resize());
 }
 
 function renderModelEditor() {
   if (!ui.modelEditor) return;
+  const editorVisible = state.modelEditorOpen && state.selectedFeatures.length === 1;
+  ui.modelEditor.classList.toggle("is-hidden", !editorVisible);
+  ui.modelEditorBackdrop.classList.toggle("is-hidden", !editorVisible);
+  setModelPreviewActive(editorVisible);
   const id = String(state.selectedFeature?.properties.id || "");
   const model = state.modelInputs.find((item) => String(item.values.lotId) === id);
   ui.modelEditorLot.textContent = state.selectedFeature
     ? `LOTE ${state.selectedFeature.properties.cod_lote || id}` : "Selecciona un lote";
   const maxHeight = model ? modelMaximumHeight(model) : 30;
   const height = model ? modelCurrentHeight(model) : 0.5;
-  ui.modelHeightInput.disabled = !model; ui.modelHeightRange.disabled = !model;
-  ui.modelHeightDown.disabled = !model || height <= 0.5; ui.modelHeightUp.disabled = !model || height >= maxHeight - 0.001;
-  ui.modelHeightInput.max = String(maxHeight); ui.modelHeightRange.max = String(maxHeight);
-  ui.modelHeightInput.value = model ? height.toFixed(1) : "0";
-  ui.modelHeightRange.value = String(height);
+  ui.modelEditorCurrentHeight.textContent = model ? nf1.format(height) : "—";
   ui.modelHeightLimit.textContent = `Tope ${nf1.format(maxHeight)} m`;
+  const floorHeight = Number(model?.values.floorHeight) || 3;
+  const currentFloors = model ? Math.ceil(height / floorHeight) : 0;
+  const maxFloors = model ? modelMaximumFloors(model) : 0;
+  ui.modelFloorCount.textContent = model ? String(currentFloors) : "—";
+  ui.modelFloorDown.disabled = !model || currentFloors <= 1;
+  ui.modelFloorUp.disabled = !model || currentFloors >= maxFloors;
+  const footprintArea = model ? featureArea({ geometry: getModelFootprint(model), properties: { area_m2: 0 } }) : null;
+  ui.modelFootprintArea.textContent = footprintArea != null ? nf0.format(footprintArea) : "—";
+  ui.modelRoofedArea.textContent = footprintArea != null ? nf0.format(footprintArea * currentFloors) : "—";
+  ui.modelFreeArea.textContent = model ? nf1.format(model.values.freeArea) : "—";
+  ui.modelRulesSummary.textContent = model
+    ? `Zona ${state.selectedFeature.properties.zona} · C.E. base ${nf1.format(model.values.ceBase)} · C.E. autorizable ${nf1.format(model.values.authorizedCe)} · C.E. máximo ${nf1.format(model.values.ceMax)} · altura calculada ${nf1.format(model.values.height)} m. Máximo operativo: ${maxFloors} pisos sobre la huella actual.`
+    : "Este lote no tiene parámetros edificatorios disponibles.";
+  ui.restoreLotModel.disabled = !model || (!state.modelEdits.has(id) && !Object.keys(state.wallEdits.get(id) || {}).length);
   const edges = [];
   if (model) {
     const geometry = getModelFootprint(model);
@@ -1235,7 +1300,12 @@ function syncModelEditHistoryButtons() {
 
 function applyModelEdit(entry, direction) {
   const value = direction === "undo" ? entry.before : entry.after;
-  if (entry.type === "wall") {
+  if (entry.type === "lot-reset") {
+    if (value?.height == null) state.modelEdits.delete(entry.id);
+    else state.modelEdits.set(entry.id, value.height);
+    if (value?.walls && Object.keys(value.walls).length) state.wallEdits.set(entry.id, { ...value.walls });
+    else state.wallEdits.delete(entry.id);
+  } else if (entry.type === "wall") {
     const offsets = { ...(state.wallEdits.get(entry.id) || {}) };
     if (value == null) delete offsets[entry.edgeKey]; else offsets[entry.edgeKey] = value;
     if (Object.keys(offsets).length) state.wallEdits.set(entry.id, offsets); else state.wallEdits.delete(entry.id);
@@ -1254,6 +1324,25 @@ function redoModelEdit() {
   const entry = state.modelEditRedo.pop();
   if (!entry) return;
   applyModelEdit(entry, "redo"); state.modelEditUndo.push(entry); persistModelEdits(); syncModelEditHistoryButtons();
+}
+
+function restoreSelectedLotModel() {
+  const id = String(state.selectedFeature?.properties.id || "");
+  if (!id) return;
+  const before = {
+    height: state.modelEdits.has(id) ? state.modelEdits.get(id) : null,
+    walls: { ...(state.wallEdits.get(id) || {}) },
+  };
+  if (before.height == null && !Object.keys(before.walls).length) return;
+  state.modelEdits.delete(id);
+  state.wallEdits.delete(id);
+  state.selectedWall = null;
+  state.modelDimension = null;
+  updateCalculation();
+  state.modelEditUndo.push({ type: "lot-reset", id, before, after: null });
+  state.modelEditRedo = [];
+  persistModelEdits();
+  syncModelEditHistoryButtons();
 }
 
 function finishModelDrag() {
@@ -1354,10 +1443,10 @@ ui.pushPull.addEventListener("click", () => {
     return;
   }
   state.pushPullMode = !state.pushPullMode;
+  state.modelEditorOpen = state.pushPullMode && state.selectedFeatures.length === 1;
   ui.pushPull.classList.toggle("is-active", state.pushPullMode);
   ui.pushPull.setAttribute("aria-pressed", String(state.pushPullMode));
   document.querySelector(".map-shell").classList.toggle("push-pull-active", state.pushPullMode);
-  ui.modelEditor.classList.toggle("is-hidden", !state.pushPullMode);
   if (state.pushPullMode) {
     map.easeTo({ pitch: Math.max(map.getPitch(), 55), duration: 450 });
     ui.modelInteractionHint.textContent = "Elija una cara en el panel y ajuste su cota, o arrástrela directamente.";
@@ -1368,7 +1457,8 @@ ui.closeModelEditor.addEventListener("click", () => {
   state.pushPullMode = false; state.selectedWall = null; state.modelDimension = null;
   ui.pushPull.classList.remove("is-active"); ui.pushPull.setAttribute("aria-pressed", "false");
   document.querySelector(".map-shell").classList.remove("push-pull-active");
-  ui.modelEditor.classList.add("is-hidden"); setSelectedFaceOverlay(); updateMapModel(state.modelInputs);
+  state.modelEditorOpen = false;
+  ui.modelEditor.classList.add("is-hidden"); ui.modelEditorBackdrop.classList.add("is-hidden"); setSelectedFaceOverlay(); updateMapModel(state.modelInputs);
 });
 ui.undoModelEdit.addEventListener("click", undoModelEdit);
 ui.redoModelEdit.addEventListener("click", redoModelEdit);
@@ -1378,14 +1468,9 @@ ui.modelFaceOffsetNumber.addEventListener("focus", beginWallControlEdit);
 ui.modelFaceOffset.addEventListener("input", changeWallControl);
 ui.modelFaceOffset.addEventListener("change", commitWallControlEdit);
 ui.modelFaceOffsetNumber.addEventListener("change", changeNumericWallControl);
-ui.modelHeightRange.addEventListener("pointerdown", beginHeightControlEdit);
-ui.modelHeightRange.addEventListener("focus", beginHeightControlEdit);
-ui.modelHeightRange.addEventListener("input", changeHeightControl);
-ui.modelHeightRange.addEventListener("change", commitHeightControlEdit);
-ui.modelHeightInput.addEventListener("focus", beginHeightControlEdit);
-ui.modelHeightInput.addEventListener("change", changeNumericHeightControl);
-ui.modelHeightDown.addEventListener("click", () => nudgeModelHeight(-0.1));
-ui.modelHeightUp.addEventListener("click", () => nudgeModelHeight(0.1));
+ui.modelFloorDown.addEventListener("click", () => setModelFloorCount(-1));
+ui.modelFloorUp.addEventListener("click", () => setModelFloorCount(1));
+ui.restoreLotModel.addEventListener("click", restoreSelectedLotModel);
 
 map.on("mousedown", (event) => {
   if (!state.pushPullMode || !state.selectedFeature || event.originalEvent?.button !== 0) return;
@@ -1409,22 +1494,6 @@ map.on("mousedown", (event) => {
     renderModelEditor();
     return;
   }
-  const hit = raycastEditableTopFace(event.point);
-  if (!hit) return;
-  const id = String(hit.properties.lotId);
-  const height = Number(hit.properties.height);
-  const center = geometryCenter(state.selectedFeature.geometry);
-  const pxPerMeter = Math.abs(projectModelPoint(center, height + 1).y - projectModelPoint(center, height).y);
-  if (!Number.isFinite(pxPerMeter) || pxPerMeter < 0.05) return;
-  event.originalEvent.preventDefault();
-  state.activeModelDrag = {
-    type: "height", id, startY: event.point.y, startHeight: height, startValue: height,
-    beforeOverride: state.modelEdits.get(id), pxPerMeter,
-    dragPanEnabled: map.dragPan.isEnabled(), boxZoomEnabled: map.boxZoom.isEnabled(), rotateEnabled: map.dragRotate.isEnabled(),
-    moved: false,
-  };
-  map.dragPan.disable(); map.boxZoom.disable(); map.dragRotate.disable();
-  map.getCanvas().style.cursor = "ns-resize";
 });
 
 map.on("mousemove", (event) => {
@@ -1447,12 +1516,6 @@ map.on("mousemove", (event) => {
     updateCalculation();
     return;
   }
-  const deltaPixels = drag.startY - event.point.y;
-  if (Math.abs(deltaPixels) > 2) drag.moved = true;
-  const maxHeight = Number(model.values.height) || drag.startHeight;
-  const height = clamp(drag.startHeight + deltaPixels / drag.pxPerMeter, 0.5, maxHeight);
-  state.modelEdits.set(drag.id, height);
-  updateCalculation();
 });
 
 map.on("mouseup", finishModelDrag);
@@ -1461,10 +1524,11 @@ window.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && state.pushPullMode) {
     finishModelDrag();
     state.pushPullMode = false;
+    state.modelEditorOpen = false;
     ui.pushPull.classList.remove("is-active");
     ui.pushPull.setAttribute("aria-pressed", "false");
     document.querySelector(".map-shell").classList.remove("push-pull-active");
-    ui.modelEditor.classList.add("is-hidden"); state.selectedWall = null; state.modelDimension = null; setSelectedFaceOverlay();
+    ui.modelEditor.classList.add("is-hidden"); ui.modelEditorBackdrop.classList.add("is-hidden"); state.selectedWall = null; state.modelDimension = null; setSelectedFaceOverlay();
     updateMapModel(state.modelInputs);
     return;
   }

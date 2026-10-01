@@ -73,27 +73,46 @@
           <small id="modelInteractionHint">Arrastre con clic derecho para girar e inclinar · Rueda para acercar</small>
         </div>
 
-        <aside class="model-editor is-hidden" id="modelEditor" aria-label="Editor del volumen 3D">
-          <div class="model-editor-heading">
-            <div><span class="eyebrow">Edición del volumen</span><h2>Push / Pull</h2></div>
-            <button id="closeModelEditor" type="button" aria-label="Cerrar editor">×</button>
+        <div class="model-editor-backdrop is-hidden" id="modelEditorBackdrop"></div>
+        <aside class="model-editor is-hidden" id="modelEditor" aria-label="Editor del volumen 3D" role="dialog">
+          <header class="model-editor-topbar">
+            <div class="model-editor-heading">
+              <div><span class="eyebrow">Edición del volumen</span><h2>Push / Pull</h2></div>
+              <button id="closeModelEditor" type="button" aria-label="Cerrar editor">×</button>
+            </div>
+            <div class="model-editor-lot" id="modelEditorLot">Selecciona un lote</div>
+          </header>
+          <div class="model-editor-preview" aria-label="Vista 3D del lote seleccionado">
+            <span>Arrastra una cara del modelo para modificarla</span>
           </div>
-          <div class="model-editor-lot" id="modelEditorLot">Selecciona un lote</div>
-          <p class="model-editor-help">Elige una cara para moverla. El signo negativo la lleva hacia el interior; el positivo, hacia afuera hasta donde permiten los parámetros del lote.</p>
-          <section class="model-height-controls">
-            <div class="model-editor-section-title"><strong>Altura del volumen</strong><span id="modelHeightLimit">Tope — m</span></div>
-            <div class="model-height-value-row"><button type="button" id="modelHeightDown" aria-label="Bajar altura 0,1 metros">−</button><input id="modelHeightInput" type="number" min="0.5" step="0.1" value="0" aria-label="Altura del modelo en metros" /><span>m</span><button type="button" id="modelHeightUp" aria-label="Subir altura 0,1 metros">+</button></div>
-            <input id="modelHeightRange" type="range" min="0.5" max="30" step="0.1" value="0" aria-label="Ajustar altura del modelo" />
-            <small>Usa − / + para cambios finos. El máximo normativo se aplica automáticamente.</small>
-          </section>
-          <div class="model-editor-section-title"><strong>Caras del volumen</strong><span id="modelFaceCount">0</span></div>
-          <div class="model-face-list" id="modelFaceList"></div>
-          <section class="model-face-controls is-hidden" id="modelFaceControls">
-            <div class="model-face-selected"><strong id="modelSelectedFace">Cara —</strong><span id="modelSelectedFaceLength">— m</span></div>
-            <label for="modelFaceOffset">Desplazamiento de la cara</label>
-            <input id="modelFaceOffset" type="range" min="-25" max="25" step="0.1" value="0" />
-            <div class="model-offset-row"><span>Interior</span><input id="modelFaceOffsetNumber" type="number" min="-25" max="25" step="0.1" value="0" /><span>Exterior</span></div>
-            <small id="modelFaceLimitHint">Área y límites del lote controlan el movimiento.</small>
+          <section class="model-editor-controls" aria-label="Opciones del lote">
+            <p class="model-editor-help">Ajusta pisos y altura, o elige una cara para moverla. El signo negativo acerca la cara al interior del lote.</p>
+            <div class="model-editor-control-grid">
+              <div class="model-editor-control-main">
+                <section class="model-height-controls">
+                  <div class="model-editor-section-title"><strong>Altura del volumen</strong><span id="modelHeightLimit">Tope — m</span></div>
+                  <div class="model-floor-actions"><button type="button" id="modelFloorDown">− Quitar piso</button><strong><span id="modelFloorCount">—</span> pisos</strong><button type="button" id="modelFloorUp">+ Agregar piso</button></div>
+                  <div class="model-height-readout"><strong id="modelEditorCurrentHeight">—</strong><span>m de altura actual</span></div>
+                  <small>La altura cambia únicamente al agregar o quitar pisos. El límite considera la zonificación, el C.E. y la huella editada.</small>
+                </section>
+                <div class="model-editor-section-title"><strong>Caras del volumen</strong><span id="modelFaceCount">0</span></div>
+                <div class="model-face-list" id="modelFaceList"></div>
+                <section class="model-face-controls is-hidden" id="modelFaceControls">
+                  <div class="model-face-selected"><strong id="modelSelectedFace">Cara —</strong><span id="modelSelectedFaceLength">— m</span></div>
+                  <label for="modelFaceOffset">Desplazamiento de la cara</label>
+                  <input id="modelFaceOffset" type="range" min="-25" max="25" step="0.1" value="0" />
+                  <div class="model-offset-row"><span>Interior</span><input id="modelFaceOffsetNumber" type="number" min="-25" max="25" step="0.1" value="0" /><span>Exterior</span></div>
+                  <small id="modelFaceLimitHint">Área y límites del lote controlan el movimiento.</small>
+                </section>
+              </div>
+              <aside class="model-editor-side-info">
+                <div class="model-editor-section-title"><strong>Mediciones</strong></div>
+                <div class="model-editor-measurements"><span>Huella <b id="modelFootprintArea">—</b> m²</span><span>Área techada <b id="modelRoofedArea">—</b> m²</span><span>Área libre mín. <b id="modelFreeArea">—</b>%</span></div>
+                <details class="model-rules"><summary>Parámetros y condiciones</summary><p id="modelRulesSummary">Los parámetros aparecen al seleccionar un lote edificable.</p><small>Según arts. 30–33: altura, área libre, C.E. y envolvente aplican simultáneamente. Los máximos no son automáticos; requieren el procedimiento correspondiente.</small></details>
+                <button class="model-reset-button" id="restoreLotModelButton" type="button" disabled>↺ Restaurar modelo base</button>
+                <small class="model-reset-help">Restaura pisos y caras a la cabida original calculada para este lote.</small>
+              </aside>
+            </div>
           </section>
         </aside>
 
