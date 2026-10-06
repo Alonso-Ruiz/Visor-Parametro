@@ -79,6 +79,27 @@ const ui = {
   mapCanvas: $("map"),
   closeModelEditor: $("closeModelEditor"),
   modelEditorLot: $("modelEditorLot"),
+  modelLotArea: $("modelLotArea"),
+  modelLotZone: $("modelLotZone"),
+  modelParcelFaces: $("modelParcelFaces"),
+  modelParcelFaceControls: $("modelParcelFaceControls"),
+  modelParcelActiveFront: $("modelParcelActiveFront"),
+  modelParcelRoadWidth: $("modelParcelRoadWidth"),
+  modelParcelRetreat: $("modelParcelRetreat"),
+  modelShapeOptions: $("modelShapeOptions"),
+  modelShapeOrientation: $("modelShapeOrientation"),
+  modelShapeParams: $("modelShapeParams"),
+  modelShapeZone: $("modelShapeZone"),
+  modelAddShapeZone: $("modelAddShapeZone"),
+  modelRemoveShapeZone: $("modelRemoveShapeZone"),
+  modelShapeStart: $("modelShapeStart"),
+  modelShapeEnd: $("modelShapeEnd"),
+  modelFloorUses: $("modelFloorUses"),
+  modelUseAreas: $("modelUseAreas"),
+  modelProgramUse: $("modelProgramUse"),
+  modelProgramFreeArea: $("modelProgramFreeArea"),
+  modelProgramRoofedArea: $("modelProgramRoofedArea"),
+  modelProgramCe: $("modelProgramCe"),
   modelFaceCount: $("modelFaceCount"),
   modelFaceList: $("modelFaceList"),
   modelFaceControls: $("modelFaceControls"),
@@ -124,16 +145,24 @@ const state = {
   redVial: null,
   districtBoundary: null,
   roadCandidates: [],
-  fillOpacity: 0.82,
+  fillOpacity: 1,
   satelliteOpacity: 0.5,
   currentUse: "multifamiliar",
   lastModel: null,
   pushPullMode: false,
   modelEditorOpen: false,
   modelPreviewActive: false,
+  allLots3dActive: false,
   modelPreviewLayerVisibility: null,
   modelEdits: loadSavedModelEdits(),
   wallEdits: loadSavedWallEdits(),
+  modelShapes: loadSavedModelShapes(),
+  shapeZones: loadSavedModelMap("sanborja-shape-zones-v1"),
+  floorUses: loadSavedModelMap("sanborja-floor-uses-v1"),
+  parcelFaces: loadSavedModelMap("sanborja-parcel-faces-v1"),
+  selectedParcelFace: null,
+  selectedShapeZone: 0,
+  modelEditorTab: "lot",
   modelEditUndo: [],
   modelEditRedo: [],
   modelInputs: [],
@@ -181,7 +210,6 @@ const map = new maplibregl.Map({
     }],
   },
 });
-map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "bottom-right");
 map.dragRotate.enable();
 map.touchZoomRotate.enableRotation();
 
@@ -242,8 +270,25 @@ function installMapLayers() {
     });
   }
   map.addSource("lots", { type: "geojson", data: state.collection });
-  map.addLayer({ id: "lots-fill", type: "fill", source: "lots", paint: { "fill-color": zoneColorExpression(), "fill-opacity": state.fillOpacity } });
+  map.addSource("lots-3d-inset", { type: "geojson", data: buildInsetLotCollection(state.collection) });
+  map.addLayer({ id: "lots-fill", type: "fill", source: "lots", layout: { visibility: state.allLots3dActive ? "none" : "visible" }, paint: { "fill-color": zoneColorExpression(), "fill-opacity": 1 } });
+  map.addLayer({
+    id: "lots-3d", type: "fill-extrusion", source: "lots-3d-inset",
+    layout: { visibility: state.allLots3dActive ? "visible" : "none" },
+    paint: {
+      "fill-extrusion-color": zoneColorExpression(),
+      "fill-extrusion-base": 0,
+      "fill-extrusion-height": ["*", ["match", ["get", "zona"], "ZDB", 0.5, "ZDM", 1, "ZDA", 1.5, "ZDB-S", 0.5, "ZDM-S", 1, "ZDA-S", 1.5, 0.5], ["+", 20, ["coalesce", ["get", "retiro_frontal"], 0]]],
+      "fill-extrusion-opacity": 0.9,
+      "fill-extrusion-vertical-gradient": true,
+    },
+  });
   map.addLayer({ id: "lots-line", type: "line", source: "lots", paint: { "line-color": "rgba(36,43,42,.92)", "line-width": ["interpolate", ["linear"], ["zoom"], 13, 0.55, 17, 1.25] } });
+  map.addLayer({
+    id: "lots-3d-outline", type: "line", source: "lots-3d-inset",
+    layout: { visibility: state.allLots3dActive ? "visible" : "none" },
+    paint: { "line-color": "#1d302a", "line-width": ["interpolate", ["linear"], ["zoom"], 13, 1.2, 16, 2.1, 19, 3], "line-opacity": 1 },
+  });
   map.addSource("district-boundary", { type: "geojson", data: state.districtBoundary });
   map.addLayer({
     id: "district-boundary-casing",
@@ -314,8 +359,10 @@ function installMapLayers() {
   if (typeof map.setLight === "function") map.setLight({ anchor: "map", color: "#ffffff", intensity: 0.58, position: [1.2, 205, 38] });
 
   const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, offset: 12, className: "lot-popup" });
+  map.getCanvas().addEventListener("mouseleave", () => popup.remove());
   map.on("mousemove", (event) => {
-    const lotFeature = map.queryRenderedFeatures(event.point, { layers: ["lots-fill"] })[0];
+    if (state.modelPreviewActive) { popup.remove(); return; }
+    const lotFeature = map.queryRenderedFeatures(event.point, { layers: [state.allLots3dActive ? "lots-3d" : "lots-fill"] })[0];
     map.getCanvas().style.cursor = state.activeModelDrag ? (state.activeModelDrag.type === "wall" ? "move" : "ns-resize") : (state.pushPullMode ? "crosshair" : (lotFeature ? "pointer" : ""));
     if (!lotFeature) {
       popup.remove();
@@ -325,8 +372,9 @@ function installMapLayers() {
     if (lot) popup.setLngLat(event.lngLat).setHTML(`<b>Lote ${escapeHtml(lot.properties.cod_lote || lot.properties.id)}</b><br>${escapeHtml(lot.properties.zona)} · ${nf0.format(featureArea(lot))} m²`).addTo(map);
   });
   map.on("click", (event) => {
+    popup.remove();
     if (state.suppressNextMapClick) { state.suppressNextMapClick = false; return; }
-    const lotFeature = map.queryRenderedFeatures(event.point, { layers: ["lots-fill"] })[0];
+    const lotFeature = map.queryRenderedFeatures(event.point, { layers: [state.allLots3dActive ? "lots-3d" : "lots-fill"] })[0];
     const lot = lotFeature ? state.featureById.get(String(lotFeature.properties.id)) : null;
     if (lot) {
       const original = event.originalEvent;
@@ -344,6 +392,87 @@ function installMapLayers() {
 
 function emptyCollection() { return { type: "FeatureCollection", features: [] }; }
 
+function buildInsetLotCollection(collection, insetMeters = 0.25) {
+  return {
+    type: "FeatureCollection",
+    features: (collection?.features || []).map((feature) => ({
+      ...feature,
+      geometry: insetLotGeometry(feature.geometry, insetMeters),
+    })),
+  };
+}
+
+function insetLotGeometry(geometry, insetMeters) {
+  if (!geometry) return geometry;
+  if (geometry.type === "Polygon") {
+    const coordinates = geometry.coordinates || [];
+    const outer = insetRing(coordinates[0], insetMeters);
+    return outer ? { ...geometry, coordinates: [outer, ...coordinates.slice(1)] } : geometry;
+  }
+  if (geometry.type === "MultiPolygon") {
+    const polygons = (geometry.coordinates || []).map((polygon) => {
+      const outer = insetRing(polygon[0], insetMeters);
+      return outer ? [outer, ...polygon.slice(1)] : polygon;
+    });
+    return { ...geometry, coordinates: polygons };
+  }
+  return geometry;
+}
+
+function insetRing(ring, insetMeters) {
+  if (!Array.isArray(ring) || ring.length < 4) return null;
+  const isClosed = ring[0][0] === ring.at(-1)[0] && ring[0][1] === ring.at(-1)[1];
+  const points = (isClosed ? ring.slice(0, -1) : ring).map((point) => [Number(point[0]), Number(point[1])]);
+  if (points.length < 3 || points.some((point) => !Number.isFinite(point[0]) || !Number.isFinite(point[1]))) return null;
+  const origin = points[0];
+  const cosLat = Math.cos((origin[1] * Math.PI) / 180);
+  const local = points.map(([lon, lat]) => [(lon - origin[0]) * 111320 * cosLat, (lat - origin[1]) * 110540]);
+  const area = local.reduce((sum, point, index) => {
+    const next = local[(index + 1) % local.length];
+    return sum + point[0] * next[1] - next[0] * point[1];
+  }, 0) / 2;
+  if (Math.abs(area) < insetMeters * insetMeters * 4) return null;
+  const orientation = Math.sign(area);
+  const shiftedEdges = local.map((point, index) => {
+    const next = local[(index + 1) % local.length];
+    const dx = next[0] - point[0];
+    const dy = next[1] - point[1];
+    const length = Math.hypot(dx, dy);
+    if (length < 0.01) return null;
+    const normal = [-dy / length * orientation, dx / length * orientation];
+    return { start: [point[0] + normal[0] * insetMeters, point[1] + normal[1] * insetMeters], direction: [dx, dy], normal };
+  });
+  if (shiftedEdges.some((edge) => !edge)) return null;
+  const insetPoints = local.map((point, index) => {
+    const previous = shiftedEdges[(index - 1 + shiftedEdges.length) % shiftedEdges.length];
+    const next = shiftedEdges[index];
+    const cross = previous.direction[0] * next.direction[1] - previous.direction[1] * next.direction[0];
+    let candidate;
+    if (Math.abs(cross) < 1e-7) {
+      candidate = [point[0] + (previous.normal[0] + next.normal[0]) * insetMeters / 2, point[1] + (previous.normal[1] + next.normal[1]) * insetMeters / 2];
+    } else {
+      const dx = next.start[0] - previous.start[0];
+      const dy = next.start[1] - previous.start[1];
+      const t = (dx * next.direction[1] - dy * next.direction[0]) / cross;
+      candidate = [previous.start[0] + previous.direction[0] * t, previous.start[1] + previous.direction[1] * t];
+    }
+    const mx = candidate[0] - point[0];
+    const my = candidate[1] - point[1];
+    const miter = Math.hypot(mx, my);
+    if (!Number.isFinite(miter) || miter > insetMeters * 4) return null;
+    return candidate;
+  });
+  if (insetPoints.some((point) => !point)) return null;
+  const insetArea = Math.abs(insetPoints.reduce((sum, point, index) => {
+    const next = insetPoints[(index + 1) % insetPoints.length];
+    return sum + point[0] * next[1] - next[0] * point[1];
+  }, 0) / 2);
+  if (insetArea < Math.max(0.1, Math.abs(area) * 0.15) || insetArea >= Math.abs(area)) return null;
+  const output = insetPoints.map(([x, y]) => [origin[0] + x / (111320 * cosLat), origin[1] + y / 110540]);
+  output.push([...output[0]]);
+  return output;
+}
+
 function loadSavedModelEdits() {
   try {
     const entries = JSON.parse(localStorage.getItem("sanborja-model-edits-v1") || "[]");
@@ -358,11 +487,33 @@ function loadSavedWallEdits() {
   } catch { return new Map(); }
 }
 
+function loadSavedModelShapes() {
+  try {
+    const entries = JSON.parse(localStorage.getItem("sanborja-model-shapes-v1") || "[]");
+    return new Map(Array.isArray(entries) ? entries.filter((entry) => Array.isArray(entry) && entry.length === 2 && entry[1] && typeof entry[1] === "object") : []);
+  } catch { return new Map(); }
+}
+
+function loadSavedModelMap(key) {
+  try {
+    const entries = JSON.parse(localStorage.getItem(key) || "[]");
+    return new Map(Array.isArray(entries) ? entries.filter((entry) => Array.isArray(entry) && entry.length === 2) : []);
+  } catch { return new Map(); }
+}
+
 function persistModelEdits() {
   try { localStorage.setItem("sanborja-model-edits-v1", JSON.stringify([...state.modelEdits])); }
   catch (error) { console.warn("No se pudo guardar el modelo editado en este navegador.", error); }
   try { localStorage.setItem("sanborja-wall-edits-v1", JSON.stringify([...state.wallEdits])); }
   catch (error) { console.warn("No se pudieron guardar las paredes editadas en este navegador.", error); }
+  try { localStorage.setItem("sanborja-model-shapes-v1", JSON.stringify([...state.modelShapes])); }
+  catch (error) { console.warn("No se pudieron guardar las formas del modelo en este navegador.", error); }
+  try { localStorage.setItem("sanborja-shape-zones-v1", JSON.stringify([...state.shapeZones])); }
+  catch (error) { console.warn("No se pudieron guardar las zonas de forma.", error); }
+  try { localStorage.setItem("sanborja-floor-uses-v1", JSON.stringify([...state.floorUses])); }
+  catch (error) { console.warn("No se pudieron guardar los usos por piso.", error); }
+  try { localStorage.setItem("sanborja-parcel-faces-v1", JSON.stringify([...state.parcelFaces])); }
+  catch (error) { console.warn("No se pudieron guardar los frentes del lote.", error); }
 }
 
 function normalizeRoadCollection(collection) {
@@ -418,7 +569,8 @@ function selectFeature(feature, zoom = true, additive = false, range = false) {
       map.setFilter("lot-selected-line", ["in", ["get", "id"], ["literal", []]]);
     }
     ui.mapModelHud.classList.add("is-hidden");
-    ui.detailPanel.classList.remove("is-open");
+    $("modifyPolygonButton").classList.add("is-hidden");
+    setDetailPanel(false);
     ui.detailEmpty.classList.remove("is-hidden");
     ui.detailContent.classList.add("is-hidden");
     clearMapModel();
@@ -427,8 +579,10 @@ function selectFeature(feature, zoom = true, additive = false, range = false) {
   }
 
   state.selectedFeature = state.selectedFeatures.includes(feature) ? feature : state.selectedFeatures.at(-1);
-  state.modelEditorOpen = state.selectedFeatures.length === 1;
-  state.pushPullMode = state.selectedFeatures.length === 1;
+  state.selectedShapeZone = 0;
+  state.selectedParcelFace = null;
+  state.modelEditorOpen = false;
+  state.pushPullMode = false;
   feature = state.selectedFeature;
   state.modelDimension = null;
   state.selectedWall = null;
@@ -449,17 +603,29 @@ function selectFeature(feature, zoom = true, additive = false, range = false) {
     ? `Cabida sobre ${nf0.format(state.selectedFeatures.length)} lotes`
     : "Cabida sobre el lote";
   ui.mapModelHud.classList.remove("is-hidden");
-  ui.pushPull.classList.toggle("is-active", state.pushPullMode);
-  ui.pushPull.setAttribute("aria-pressed", String(state.pushPullMode));
-  document.querySelector(".map-shell").classList.toggle("push-pull-active", state.pushPullMode);
+  ui.pushPull.classList.remove("is-active");
+  ui.pushPull.setAttribute("aria-pressed", "false");
+  document.querySelector(".map-shell").classList.remove("push-pull-active");
   ui.detailEmpty.classList.add("is-hidden");
   ui.detailContent.classList.remove("is-hidden");
-  if (window.matchMedia("(max-width: 760px)").matches) ui.detailPanel.classList.remove("is-open");
-  else ui.detailPanel.classList.add("is-open");
+  setDetailPanel(true);
+  const modifyButton = $("modifyPolygonButton");
+  if (modifyButton) {
+    modifyButton.disabled = state.selectedFeatures.length !== 1;
+    modifyButton.classList.toggle("is-hidden", state.selectedFeatures.length !== 1);
+  }
   ui.print.disabled = false;
   ui.printDetail.disabled = false;
   configureUses(props.zona);
   detectRoads(feature);
+  const savedFront = Object.values(state.parcelFaces.get(id) || {}).find((entry) => entry.active);
+  if (savedFront) {
+    ui.roadSelect.value = "manual";
+    ui.roadWidth.readOnly = false;
+    ui.roadWidth.value = savedFront.width;
+    ui.retreat.value = savedFront.retreat;
+    ui.roadSourceMeta.textContent = "Frente configurado por cara del predio en PREDIAL · Lote.";
+  }
   updateCalculation();
 }
 
@@ -476,6 +642,11 @@ function configureUses(zone) {
   });
   ui.use.value = state.currentUse;
   ui.use.disabled = !definition;
+  if (ui.modelProgramUse) {
+    ui.modelProgramUse.innerHTML = ui.use.innerHTML;
+    ui.modelProgramUse.value = state.currentUse;
+    ui.modelProgramUse.disabled = !definition;
+  }
 }
 
 function detectRoads(feature) {
@@ -718,7 +889,8 @@ function featureArea(feature) {
   const sourceArea = Number(feature.properties.area_m2);
   if (sourceArea > 0) return sourceArea;
   const polygons = polygonsFromGeometry(feature.geometry);
-  return polygons.reduce((total, polygon) => total + Math.abs(planarRingArea(polygon[0])), 0);
+  return polygons.reduce((total, polygon) => total + Math.abs(planarRingArea(polygon[0]))
+    - polygon.slice(1).reduce((holes, ring) => holes + Math.abs(planarRingArea(ring)), 0), 0);
 }
 
 function polygonsFromGeometry(geometry) {
@@ -859,6 +1031,229 @@ function scaleGeometry(geometry, scale, anchor = geometryCenter(geometry)) {
   };
 }
 
+function morphologyTemplate(type, shape = {}) {
+  const ratio = (key, fallback) => clamp(Number(shape[key] ?? fallback) / 100, 0.1, 0.7);
+  if (type === "l") { const body = ratio("body", 42); const arm = ratio("arm", 42); return [[[0, 0], [1, 0], [1, body], [arm, body], [arm, 1], [0, 1], [0, 0]]]; }
+  if (type === "u") { const body = ratio("body", 36); const left = ratio("leftArm", 27); const right = ratio("rightArm", 27); return [[[0, 0], [1, 0], [1, 1], [1 - right, 1], [1 - right, body], [left, body], [left, 1], [0, 1], [0, 0]]]; }
+  if (type === "patio") {
+    const front = ratio("front", 25); const back = ratio("back", 25);
+    const left = ratio("leftArm", 25); const right = ratio("rightArm", 25);
+    return [
+      [[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]],
+      [[left, front], [left, 1 - back], [1 - right, 1 - back], [1 - right, front], [left, front]],
+    ];
+  }
+  if (type === "blocks") {
+    const halfGap = ratio("gap", 20) / 2; const left = 0.5 - halfGap; const right = 0.5 + halfGap;
+    return [
+      [[0, 0], [left, 0], [left, 1], [0, 1], [0, 0]],
+      [[right, 0], [1, 0], [1, 1], [right, 1], [right, 0]],
+    ];
+  }
+  return null;
+}
+
+function rotateMorphologyPoint(point, turns) {
+  let [x, y] = point;
+  for (let i = 0; i < turns; i += 1) [x, y] = [1 - y, x];
+  return [x, y];
+}
+
+function ringFitsInsideParcel(ring, lotPolygon) {
+  const outer = lotPolygon[0];
+  const origin = outer[0];
+  const cosLat = Math.cos((origin[1] * Math.PI) / 180);
+  const toLocal = (point) => [(point[0] - origin[0]) * 111320 * cosLat, (point[1] - origin[1]) * 110540];
+  const candidate = ring.map(toLocal);
+  const boundaries = lotPolygon.map((lotRing) => lotRing.map(toLocal));
+  for (let i = 0; i < ring.length - 1; i += 1) {
+    const a = candidate[i]; const b = candidate[i + 1];
+    for (let j = 0; j < boundaries[0].length - 1; j += 1) {
+      if (segmentsProperlyIntersect2d(a, b, boundaries[0][j], boundaries[0][j + 1])) return false;
+    }
+    for (const hole of boundaries.slice(1)) {
+      for (let j = 0; j < hole.length - 1; j += 1) if (segmentsIntersect2d(a, b, hole[j], hole[j + 1])) return false;
+    }
+    for (const t of [0, 0.25, 0.5, 0.75, 1]) {
+      const sample = [ring[i][0] + (ring[i + 1][0] - ring[i][0]) * t, ring[i][1] + (ring[i + 1][1] - ring[i][1]) * t];
+      const sampleLocal = toLocal(sample);
+      const onOuter = boundaries[0].some((point, edgeIndex) => pointOnSegment2d(sampleLocal, point, boundaries[0][(edgeIndex + 1) % (boundaries[0].length - 1)]));
+      if (!onOuter && !pointInGeoRing(sample, outer)) return false;
+      if (lotPolygon.slice(1).some((hole) => pointInGeoRing(sample, hole))) return false;
+    }
+  }
+  return ringIsSimple(ring);
+}
+
+function fitMorphologyToPolygon(lotPolygon, template, occupancy, turns) {
+  const outer = lotPolygon[0];
+  const points = localRing(outer);
+  if (points.length < 3) return null;
+  const center = [
+    outer.slice(0, -1).reduce((sum, point) => sum + point[0] / (outer.length - 1), 0),
+    outer.slice(0, -1).reduce((sum, point) => sum + point[1] / (outer.length - 1), 0),
+  ];
+  let xx = 0; let yy = 0; let xy = 0;
+  for (const point of points) { xx += point[0] * point[0]; yy += point[1] * point[1]; xy += point[0] * point[1]; }
+  const angle = 0.5 * Math.atan2(2 * xy, xx - yy);
+  const u = [Math.cos(angle), Math.sin(angle)]; const v = [-u[1], u[0]];
+  const projected = points.map((point) => [point[0] * u[0] + point[1] * u[1], point[0] * v[0] + point[1] * v[1]]);
+  const minU = Math.min(...projected.map((point) => point[0])); const maxU = Math.max(...projected.map((point) => point[0]));
+  const minV = Math.min(...projected.map((point) => point[1])); const maxV = Math.max(...projected.map((point) => point[1]));
+  const width = maxU - minU; const depth = maxV - minV;
+  if (width < 0.1 || depth < 0.1) return null;
+  const rotated = template.map((ring) => ring.map((point) => rotateMorphologyPoint(point, turns)));
+  const templateArea = Math.abs(rotated.reduce((sum, ring) => sum + ring.reduce((area, point, i) => {
+    const next = ring[(i + 1) % ring.length]; return area + point[0] * next[1] - next[0] * point[1];
+  }, 0) / 2, 0));
+  const boxArea = width * depth;
+  const lotArea = Math.abs(ringSignedAreaMeters(outer));
+  const maxScale = Math.min(1, Math.sqrt((lotArea * occupancy) / Math.max(boxArea * templateArea, 0.01)));
+  const originLat = center[1]; const cosLat = Math.cos((originLat * Math.PI) / 180);
+  const centers = [0.3, 0.5, 0.7];
+  for (let step = 0; step <= 16; step += 1) {
+    const scale = maxScale * (1 - step * 0.045);
+    if (scale < 0.25) break;
+    for (const cu of centers) for (const cv of centers) {
+      const centerU = minU + width * cu; const centerV = minV + depth * cv;
+      const candidateRings = rotated.map((ring) => {
+        const geoRing = ring.map(([x, y]) => {
+          const localU = centerU + (x - 0.5) * width * scale;
+          const localV = centerV + (y - 0.5) * depth * scale;
+          const east = u[0] * localU + v[0] * localV;
+          const north = u[1] * localU + v[1] * localV;
+          return [center[0] + east / (111320 * cosLat), center[1] + north / 110540];
+        });
+        return geoRing;
+      });
+      if (candidateRings.every((ring) => ringFitsInsideParcel(ring, lotPolygon))) return candidateRings;
+    }
+  }
+  return null;
+}
+
+function buildModelBaseFootprint(model, shapeOverride = null) {
+  const shape = shapeOverride || state.modelShapes.get(String(model.values.lotId)) || { type: "lot", orientation: 0 };
+  const occupancy = Math.max(0.05, 1 - model.values.freeArea / 100);
+  if (!shape.type || shape.type === "lot") return scaleGeometry(model.feature.geometry, Math.sqrt(occupancy));
+  const template = morphologyTemplate(shape.type, shape);
+  if (!template) return scaleGeometry(model.feature.geometry, Math.sqrt(occupancy));
+  const resultPolygons = [];
+  for (const lotPolygon of polygonsFromGeometry(model.feature.geometry)) {
+    const fitted = fitMorphologyToPolygon(lotPolygon, template, occupancy, clamp(Number(shape.orientation) || 0, 0, 3));
+    if (!fitted) return null;
+    if (shape.type === "blocks") resultPolygons.push(...fitted.map((ring) => [ring]));
+    else resultPolygons.push(fitted);
+  }
+  if (!resultPolygons.length) return null;
+  return resultPolygons.length === 1
+    ? { type: "Polygon", coordinates: resultPolygons[0] }
+    : { type: "MultiPolygon", coordinates: resultPolygons };
+}
+
+function getModelBaseFootprint(model) {
+  return buildModelBaseFootprint(model) || scaleGeometry(model.feature.geometry, Math.sqrt(Math.max(0.05, 1 - model.values.freeArea / 100)));
+}
+
+function modelFaceContext(model, zoneIndex = 0) {
+  const id = String(model.values.lotId);
+  const zone = (state.shapeZones.get(id) || [])[zoneIndex - 1];
+  return { id, zone, editKey: zone ? `${id}@${zone.id}` : id, base: zone ? buildModelBaseFootprint(model, zone) : getModelBaseFootprint(model) };
+}
+
+function modelZoneIndexForFloor(lotId, floor) {
+  return (state.shapeZones.get(String(lotId)) || []).findIndex((zone) => floor >= zone.start && floor <= zone.end) + 1;
+}
+
+function modelFootprintForFloor(model, floor) {
+  const id = String(model.values.lotId);
+  const context = modelFaceContext(model, modelZoneIndexForFloor(id, floor));
+  return applyWallOffsets(context.base || getModelBaseFootprint(model), state.wallEdits.get(context.editKey) || {});
+}
+
+function buildEditableFaceGroups(geometry) {
+  const groups = [];
+  polygonsFromGeometry(geometry).forEach((polygon, polygonIndex) => {
+    const ring = polygon[0];
+    if (!ring || ring.length < 4) return;
+    const local = localRing(ring); const count = local.length;
+    const edges = Array.from({ length: count }, (_, edgeIndex) => {
+      const a = local[edgeIndex]; const b = local[(edgeIndex + 1) % count];
+      const dx = b[0] - a[0]; const dy = b[1] - a[1]; const length = Math.hypot(dx, dy) || 1;
+      return { polygonIndex, edgeIndex, key: `${polygonIndex}:${edgeIndex}`, direction: [dx / length, dy / length], length };
+    });
+    // Cadastral boundaries often contain several short GIS segments for what a
+    // person sees as one side. Allow small changes in direction, while limiting
+    // the total turn from the start of a face so real corners stay separate.
+    const maxFaceTurn = Math.sin(25 * Math.PI / 180);
+    const canMerge = (first, second) => first.length < 0.25 || second.length < 0.25
+      || (Math.abs(cross2d(first.direction, second.direction)) <= maxFaceTurn && first.direction[0] * second.direction[0] + first.direction[1] * second.direction[1] > 0);
+    const breaks = edges.map((edge, index) => !canMerge(edges[(index - 1 + count) % count], edge));
+    // A densely sampled curved perimeter may have no sharp corner. Start at
+    // its longest segment and split it as accumulated direction changes grow.
+    const start = breaks.some(Boolean) ? breaks.findIndex(Boolean) : edges.reduce((best, edge, index) => edge.length > edges[best].length ? index : best, 0);
+    let current = [];
+    const flush = () => {
+      if (!current.length) return;
+      const firstEdge = current[0].edgeIndex;
+      groups.push({ polygonIndex, key: `${polygonIndex}:face:${firstEdge}`, edges: current, length: current.reduce((sum, edge) => sum + edge.length, 0) });
+      current = [];
+    };
+    for (let step = 0; step < count; step += 1) {
+      const index = (start + step) % count;
+      if (current.length && (!canMerge(current.at(-1), edges[index]) || !canMerge(current[0], edges[index]))) flush();
+      current.push(edges[index]);
+    }
+    flush();
+  });
+  return groups;
+}
+
+function averageFaceOffset(offsets, face) {
+  if (!face?.edges.length) return 0;
+  return face.edges.reduce((sum, edge) => sum + (Number(offsets[edge.key]) || 0), 0) / face.edges.length;
+}
+
+function constrainWallFaceOffsets(model, baseGeometry, face, startOffsets, desiredValue) {
+  const before = { ...startOffsets };
+  const current = averageFaceOffset(before, face);
+  const desired = clamp(Number(desiredValue) || 0, -25, 25);
+  const delta = desired - current;
+  const maxArea = featureArea({ geometry: baseGeometry, properties: { area_m2: 0 } });
+  const at = (factor) => {
+    const offsets = { ...before };
+    for (const edge of face.edges) {
+      const value = (Number(before[edge.key]) || 0) + delta * factor;
+      if (Math.abs(value) < 0.005) delete offsets[edge.key]; else offsets[edge.key] = value;
+    }
+    const geometry = applyWallOffsets(baseGeometry, offsets);
+    return footprintRespectsLotAndArea(geometry, model.feature.geometry, maxArea, baseGeometry) ? offsets : null;
+  };
+  let factor = 1; let offsets = at(factor);
+  if (!offsets) {
+    let low = 0; let high = 1;
+    for (let i = 0; i < 16; i += 1) {
+      const middle = (low + high) / 2;
+      if (at(middle)) low = middle; else high = middle;
+    }
+    factor = low; offsets = at(factor) || before;
+  }
+  return { offsets, value: current + delta * factor };
+}
+
+function normalizeFaceOffsets(model, baseGeometry, sourceOffsets) {
+  const source = { ...sourceOffsets }; const normalized = {};
+  for (const face of buildEditableFaceGroups(baseGeometry)) {
+    const hasEdits = face.edges.some((edge) => Object.hasOwn(source, edge.key));
+    if (!hasEdits) continue;
+    const value = averageFaceOffset(source, face);
+    if (Math.abs(value) < 0.005) continue;
+    const result = constrainWallFaceOffsets(model, baseGeometry, face, normalized, value);
+    Object.assign(normalized, result.offsets);
+  }
+  return normalized;
+}
+
 function edgeNormalMeters(a, b, latitude, counterClockwise) {
   const dx = (b[0] - a[0]) * 111320 * Math.cos((latitude * Math.PI) / 180);
   const dy = (b[1] - a[1]) * 110540;
@@ -867,32 +1262,120 @@ function edgeNormalMeters(a, b, latitude, counterClockwise) {
 }
 
 function ringSignedAreaMeters(ring) {
-  const center = ring.reduce((sum, point) => [sum[0] + point[0] / ring.length, sum[1] + point[1] / ring.length], [0, 0]);
-  const cosLat = Math.cos((center[1] * Math.PI) / 180);
+  const points = localRing(ring);
   let area = 0;
-  for (let i = 0; i < ring.length - 1; i += 1) {
-    const ax = ring[i][0] * 111320 * cosLat; const ay = ring[i][1] * 110540;
-    const bx = ring[i + 1][0] * 111320 * cosLat; const by = ring[i + 1][1] * 110540;
-    area += ax * by - bx * ay;
+  for (let i = 0; i < points.length; i += 1) {
+    const current = points[i]; const next = points[(i + 1) % points.length];
+    area += current[0] * next[1] - next[0] * current[1];
   }
   return area / 2;
+}
+
+function cross2d(a, b) {
+  return a[0] * b[1] - a[1] * b[0];
+}
+
+function pointOnSegment2d(point, a, b, epsilon = 1e-6) {
+  const relative = [point[0] - a[0], point[1] - a[1]];
+  const direction = [b[0] - a[0], b[1] - a[1]];
+  if (Math.abs(cross2d(relative, direction)) > epsilon * Math.max(1, Math.hypot(...direction))) return false;
+  const dot = relative[0] * direction[0] + relative[1] * direction[1];
+  return dot >= -epsilon && dot <= direction[0] ** 2 + direction[1] ** 2 + epsilon;
+}
+
+function segmentsIntersect2d(a, b, c, d) {
+  const ab = [b[0] - a[0], b[1] - a[1]];
+  const cd = [d[0] - c[0], d[1] - c[1]];
+  const o1 = cross2d(ab, [c[0] - a[0], c[1] - a[1]]);
+  const o2 = cross2d(ab, [d[0] - a[0], d[1] - a[1]]);
+  const o3 = cross2d(cd, [a[0] - c[0], a[1] - c[1]]);
+  const o4 = cross2d(cd, [b[0] - c[0], b[1] - c[1]]);
+  const epsilon = 1e-7;
+  if (((o1 > epsilon && o2 < -epsilon) || (o1 < -epsilon && o2 > epsilon))
+    && ((o3 > epsilon && o4 < -epsilon) || (o3 < -epsilon && o4 > epsilon))) return true;
+  return (Math.abs(o1) <= epsilon && pointOnSegment2d(c, a, b))
+    || (Math.abs(o2) <= epsilon && pointOnSegment2d(d, a, b))
+    || (Math.abs(o3) <= epsilon && pointOnSegment2d(a, c, d))
+    || (Math.abs(o4) <= epsilon && pointOnSegment2d(b, c, d));
+}
+
+function segmentsProperlyIntersect2d(a, b, c, d) {
+  const orient = (p, q, r) => cross2d([q[0] - p[0], q[1] - p[1]], [r[0] - p[0], r[1] - p[1]]);
+  const epsilon = 1e-7;
+  const o1 = orient(a, b, c); const o2 = orient(a, b, d);
+  const o3 = orient(c, d, a); const o4 = orient(c, d, b);
+  return ((o1 > epsilon && o2 < -epsilon) || (o1 < -epsilon && o2 > epsilon))
+    && ((o3 > epsilon && o4 < -epsilon) || (o3 < -epsilon && o4 > epsilon));
+}
+
+function ringIsSimple(ring) {
+  if (!ring || ring.length < 4) return false;
+  const points = localRing(ring);
+  for (let i = 0; i < points.length; i += 1) {
+    const nextI = (i + 1) % points.length;
+    if (Math.hypot(points[nextI][0] - points[i][0], points[nextI][1] - points[i][1]) < 0.05) return false;
+    for (let j = i + 1; j < points.length; j += 1) {
+      const nextJ = (j + 1) % points.length;
+      if (j === i || nextJ === i || nextI === j) continue;
+      if (segmentsIntersect2d(points[i], points[nextI], points[j], points[nextJ])) return false;
+    }
+  }
+  return true;
 }
 
 function applyWallOffsets(geometry, offsets = {}) {
   const transformRing = (ring, polygonIndex, isOuter) => {
     if (!isOuter || ring.length < 4) return ring.map((point) => [...point]);
-    const points = ring.slice(0, -1); const ccw = ringSignedAreaMeters(ring) > 0;
+    if (!Object.keys(offsets).some((key) => key.startsWith(`${polygonIndex}:`) && Math.abs(Number(offsets[key]) || 0) >= 0.005)) return ring.map((point) => [...point]);
+    const points = ring.slice(0, -1);
+    const local = localRing(ring);
+    const origin = [
+      points.reduce((sum, point) => sum + point[0] / points.length, 0),
+      points.reduce((sum, point) => sum + point[1] / points.length, 0),
+    ];
+    const cosLat = Math.cos((origin[1] * Math.PI) / 180);
+    const ccw = ringSignedAreaMeters(ring) > 0;
+    const groups = buildEditableFaceGroups({ type: "Polygon", coordinates: [ring] });
+    const groupByEdge = new Map();
+    const lines = new Map();
+    for (const group of groups) {
+      const first = group.edges[0].edgeIndex;
+      const last = (group.edges.at(-1).edgeIndex + 1) % points.length;
+      const a = local[first]; const b = local[last];
+      const length = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+      const direction = [(b[0] - a[0]) / length, (b[1] - a[1]) / length];
+      const normal = ccw ? [direction[1], -direction[0]] : [-direction[1], direction[0]];
+      const offset = averageFaceOffset(offsets, { edges: group.edges.map((edge) => ({ key: `${polygonIndex}:${edge.edgeIndex}` })) });
+      lines.set(group.key, { a: [a[0] + normal[0] * offset, a[1] + normal[1] * offset], direction, offset, first, last });
+      for (const edge of group.edges) groupByEdge.set(edge.edgeIndex, group.key);
+    }
     const moved = points.map((point, vertexIndex) => {
       const prevIndex = (vertexIndex - 1 + points.length) % points.length;
-      const prevOffset = Number(offsets[`${polygonIndex}:${prevIndex}`]) || 0;
-      const nextOffset = Number(offsets[`${polygonIndex}:${vertexIndex}`]) || 0;
-      const prevNormal = edgeNormalMeters(points[prevIndex], point, point[1], ccw);
-      const nextNormal = edgeNormalMeters(point, points[(vertexIndex + 1) % points.length], point[1], ccw);
-      const count = (Math.abs(prevOffset) > 1e-8 ? 1 : 0) + (Math.abs(nextOffset) > 1e-8 ? 1 : 0);
-      const divisor = count || 1;
-      const dx = (prevNormal[0] * prevOffset + nextNormal[0] * nextOffset) / divisor;
-      const dy = (prevNormal[1] * prevOffset + nextNormal[1] * nextOffset) / divisor;
-      return [point[0] + dx / (111320 * Math.cos((point[1] * Math.PI) / 180)), point[1] + dy / 110540];
+      const previous = lines.get(groupByEdge.get(prevIndex));
+      const next = lines.get(groupByEdge.get(vertexIndex));
+      const current = local[vertexIndex];
+      let result;
+      if (previous === next) {
+        if (Math.abs(next.offset) < 0.005) result = current;
+        else {
+          const along = (current[0] - next.a[0]) * next.direction[0] + (current[1] - next.a[1]) * next.direction[1];
+          result = [next.a[0] + next.direction[0] * along, next.a[1] + next.direction[1] * along];
+        }
+      } else {
+        const denominator = cross2d(previous.direction, next.direction);
+        const delta = [next.a[0] - previous.a[0], next.a[1] - previous.a[1]];
+        if (Math.abs(denominator) > 1e-7) {
+          const distance = cross2d(delta, next.direction) / denominator;
+          result = [previous.a[0] + previous.direction[0] * distance, previous.a[1] + previous.direction[1] * distance];
+        } else result = [(previous.a[0] + next.a[0]) / 2, (previous.a[1] + next.a[1]) / 2];
+        const maxMiter = Math.max(1.5, Math.max(Math.abs(previous.offset), Math.abs(next.offset)) * 4 + 0.5);
+        if (Math.hypot(result[0] - current[0], result[1] - current[1]) > maxMiter) {
+          const prevPoint = [current[0] + (previous.a[0] - local[previous.first][0]), current[1] + (previous.a[1] - local[previous.first][1])];
+          const nextPoint = [current[0] + (next.a[0] - local[next.first][0]), current[1] + (next.a[1] - local[next.first][1])];
+          result = [(prevPoint[0] + nextPoint[0]) / 2, (prevPoint[1] + nextPoint[1]) / 2];
+        }
+      }
+      return [origin[0] + result[0] / (111320 * cosLat), origin[1] + result[1] / 110540];
     });
     return [...moved, [...moved[0]]];
   };
@@ -909,31 +1392,53 @@ function pointInGeoRing(point, ring) {
   return inside;
 }
 
-function footprintRespectsLotAndArea(geometry, lotGeometry, maxArea) {
+function footprintRespectsLotAndArea(geometry, lotGeometry, maxArea, referenceGeometry = geometry) {
   const lotPolygons = polygonsFromGeometry(lotGeometry);
-  for (const polygon of polygonsFromGeometry(geometry)) {
+  const editedPolygons = polygonsFromGeometry(geometry);
+  const referencePolygons = polygonsFromGeometry(referenceGeometry);
+  if (editedPolygons.length !== referencePolygons.length) return false;
+  for (let polygonIndex = 0; polygonIndex < editedPolygons.length; polygonIndex += 1) {
+    const polygon = editedPolygons[polygonIndex];
     const ring = polygon[0];
-    for (let index = 0; index < ring.length - 1; index += 1) {
-      if (!lotPolygons.some((lotPolygon) => pointInGeoRing(ring[index], lotPolygon[0]))) return false;
+    const referenceRing = referencePolygons[polygonIndex]?.[0];
+    const lotPolygon = editedPolygons.length === lotPolygons.length ? lotPolygons[polygonIndex]
+      : lotPolygons.find((candidate) => referenceRing && ringFitsInsideParcel(referenceRing, candidate));
+    if (!ringIsSimple(ring) || !lotPolygon || !referenceRing || Math.sign(ringSignedAreaMeters(ring)) !== Math.sign(ringSignedAreaMeters(referenceRing))) return false;
+    for (const hole of polygon.slice(1)) {
+      if (!ringIsSimple(hole) || hole.slice(0, -1).some((point) => !pointInGeoRing(point, ring))) return false;
+      for (let i = 0; i < hole.length - 1; i += 1) {
+        const a = hole[i]; const b = hole[i + 1];
+        for (let j = 0; j < ring.length - 1; j += 1) if (segmentsProperlyIntersect2d(a, b, ring[j], ring[j + 1])) return false;
+      }
     }
+    const origin = lotPolygon[0][0];
+    const cosLat = Math.cos((origin[1] * Math.PI) / 180);
+    const toLocal = (point) => [(point[0] - origin[0]) * 111320 * cosLat, (point[1] - origin[1]) * 110540];
+    const edited = ring.map(toLocal);
+    const boundaries = lotPolygon.map((lotRing) => lotRing.map(toLocal));
+    for (let index = 0; index < ring.length - 1; index += 1) {
+      const a = edited[index]; const b = edited[index + 1];
+      for (let j = 0; j < boundaries[0].length - 1; j += 1) {
+        if (segmentsProperlyIntersect2d(a, b, boundaries[0][j], boundaries[0][j + 1])) return false;
+      }
+      for (const hole of boundaries.slice(1)) {
+        for (let j = 0; j < hole.length - 1; j += 1) {
+          if (segmentsIntersect2d(a, b, hole[j], hole[j + 1])) return false;
+        }
+      }
+      for (const t of [0, 0.25, 0.5, 0.75, 1]) {
+        const sample = [ring[index][0] + (ring[index + 1][0] - ring[index][0]) * t, ring[index][1] + (ring[index + 1][1] - ring[index][1]) * t];
+        const sampleLocal = toLocal(sample);
+        const onOuter = boundaries[0].some((point, edgeIndex) => pointOnSegment2d(sampleLocal, point, boundaries[0][(edgeIndex + 1) % (boundaries[0].length - 1)]));
+        if (!onOuter && !pointInGeoRing(sample, lotPolygon[0])) return false;
+        if (lotPolygon.slice(1).some((hole) => pointInGeoRing(sample, hole))) return false;
+      }
+    }
+    const editedArea = Math.abs(ringSignedAreaMeters(ring));
+    const referenceArea = Math.abs(ringSignedAreaMeters(referenceRing));
+    if (editedArea < Math.max(0.25, referenceArea * 0.03) || editedArea > referenceArea + 0.05) return false;
   }
   return featureArea({ geometry, properties: { area_m2: 0 } }) <= maxArea + 0.05;
-}
-
-function constrainWallOffset(model, baseGeometry, edgeKey, currentValue, desiredValue, offsets) {
-  const maxArea = featureArea({ geometry: baseGeometry, properties: { area_m2: 0 } });
-  const valid = (candidate) => {
-    const next = { ...offsets, [edgeKey]: candidate };
-    return footprintRespectsLotAndArea(applyWallOffsets(baseGeometry, next), model.feature.geometry, maxArea);
-  };
-  if (valid(desiredValue)) return desiredValue;
-  let low = 0; let high = 1;
-  for (let i = 0; i < 16; i += 1) {
-    const mid = (low + high) / 2;
-    if (valid(currentValue + (desiredValue - currentValue) * mid)) low = mid;
-    else high = mid;
-  }
-  return currentValue + (desiredValue - currentValue) * low;
 }
 
 function updateMapModel(models) {
@@ -943,17 +1448,22 @@ function updateMapModel(models) {
   const epapFeatures = [];
   let activeModelMetrics = null;
   for (const { feature, values } of models) {
-    const footprintRatio = Math.max(0.05, 1 - values.freeArea / 100);
-    const baseFootprint = scaleGeometry(feature.geometry, Math.sqrt(footprintRatio));
+    const model = { feature, values };
+    const baseFootprint = getModelBaseFootprint(model);
     const savedOffsets = state.wallEdits.get(values.lotId) || {};
-    const validOffsets = {};
-    for (const [edgeKey, rawOffset] of Object.entries(savedOffsets)) {
-      const offset = Number(rawOffset);
-      if (!Number.isFinite(offset)) continue;
-      validOffsets[edgeKey] = constrainWallOffset({ feature, values }, baseFootprint, edgeKey, 0, offset, validOffsets);
-    }
+    const finiteOffsets = Object.fromEntries(Object.entries(savedOffsets)
+      .filter(([, offset]) => Number.isFinite(Number(offset)))
+      .map(([key, offset]) => [key, Number(offset)]));
+    const validOffsets = normalizeFaceOffsets(model, baseFootprint, finiteOffsets);
     if (Object.keys(validOffsets).length) state.wallEdits.set(values.lotId, validOffsets);
     else state.wallEdits.delete(values.lotId);
+    for (let zoneIndex = 1; zoneIndex <= (state.shapeZones.get(values.lotId) || []).length; zoneIndex += 1) {
+      const context = modelFaceContext(model, zoneIndex);
+      if (!context.base) continue;
+      const zoneOffsets = normalizeFaceOffsets(model, context.base, state.wallEdits.get(context.editKey) || {});
+      if (Object.keys(zoneOffsets).length) state.wallEdits.set(context.editKey, zoneOffsets);
+      else state.wallEdits.delete(context.editKey);
+    }
     const footprint = applyWallOffsets(baseFootprint, validOffsets);
     const footprintArea = featureArea({ geometry: footprint, properties: { area_m2: 0 } });
     const normativeHeight = Number(values.height) || values.floors * values.floorHeight;
@@ -965,16 +1475,29 @@ function updateMapModel(models) {
     const requestedHeight = Number(state.modelEdits.get(values.lotId) ?? baseHeight);
     const requestedFloors = Math.max(1, Math.round(requestedHeight / values.floorHeight));
     const editedHeight = clamp(requestedFloors * values.floorHeight, 0.5, maxAllowedHeight);
-    const floorCount = Math.ceil(editedHeight / values.floorHeight);
+    const requestedFloorCount = Math.ceil(editedHeight / values.floorHeight);
+    const floorGeometries = [];
+    let roofedArea = 0;
+    for (let floor = 1; floor <= requestedFloorCount; floor += 1) {
+      const geometry = modelFootprintForFloor(model, floor);
+      const area = featureArea({ geometry, properties: { area_m2: 0 } });
+      if (roofedArea + area > values.lotArea * values.authorizedCe + 0.05) break;
+      roofedArea += area;
+      floorGeometries.push({ geometry, area });
+    }
+    const floorCount = floorGeometries.length;
+    const actualHeight = floorCount * values.floorHeight;
     if (String(state.selectedFeature?.properties.id) === values.lotId) {
-      const measuredFloors = Math.ceil(editedHeight / values.floorHeight);
-      activeModelMetrics = { height: editedHeight, floors: measuredFloors, area: footprintArea * measuredFloors, footprintArea, freeArea: values.freeArea, authorizedCe: values.authorizedCe, ceMax: values.ceMax, ceBase: values.ceBase, edited: state.modelEdits.has(values.lotId), maxHeight: maxAllowedHeight, maxFloors: maxAllowedFloors };
+      activeModelMetrics = { height: actualHeight, floors: floorCount, area: roofedArea, footprintArea: floorGeometries[0]?.area || footprintArea, freeArea: values.freeArea, authorizedCe: values.authorizedCe, ceMax: values.ceMax, ceBase: values.ceBase, edited: state.modelEdits.has(values.lotId), maxHeight: maxAllowedHeight, maxFloors: maxAllowedFloors };
     }
     for (let index = 0; index < floorCount; index += 1) {
-      const gap = index ? 0.08 : 0;
-      const floorBase = index * values.floorHeight + gap;
-      const floorTop = Math.min((index + 1) * values.floorHeight, editedHeight);
+      // Keep storeys flush: an artificial gap makes one continuous wall look
+      // like several independent strips when a full face is pushed or pulled.
+      const floorBase = index * values.floorHeight;
+      const floorTop = (index + 1) * values.floorHeight;
       if (floorTop <= floorBase + 0.02) continue;
+      const use = (state.floorUses.get(values.lotId) || {})[index + 1] || "residencial";
+      const color = use === "comercial" ? "#cf6b39" : use === "equipamiento" ? "#5676bb" : "#16845f";
       floors.push({
         type: "Feature",
         properties: {
@@ -982,9 +1505,11 @@ function updateMapModel(models) {
           editable: true,
           base: floorBase,
           height: floorTop,
-          color: index % 2 ? (values.epapEnabled ? "#00a968" : "#1e805a") : (values.epapEnabled ? "#008f58" : "#176c4c"),
+          floor: index + 1,
+          use,
+          color,
         },
-        geometry: footprint,
+        geometry: floorGeometries[index].geometry,
       });
     }
     const points = allGeometryPoints(feature.geometry);
@@ -996,6 +1521,7 @@ function updateMapModel(models) {
   map.getSource("cabida-model").setData({ type: "FeatureCollection", features: floors });
   map.getSource("epap-model").setData({ type: "FeatureCollection", features: epapFeatures });
   if (activeModelMetrics) {
+    state.activeModelMetrics = activeModelMetrics;
     ui.modelHeight.textContent = nf1.format(activeModelMetrics.height);
     ui.modelFloors.textContent = nf1.format(activeModelMetrics.floors);
     ui.modelArea.textContent = nf0.format(activeModelMetrics.area);
@@ -1030,8 +1556,11 @@ function raycastEditableWall(point) {
   const selectedId = String(state.selectedFeature?.properties.id || "");
   for (const hit of hits) {
     if (!hit.properties?.editable || String(hit.properties.lotId) !== selectedId) continue;
-    const polygons = hit.geometry?.type === "Polygon" ? [hit.geometry.coordinates]
-      : hit.geometry?.type === "MultiPolygon" ? hit.geometry.coordinates : [];
+    const model = state.modelInputs.find((item) => String(item.values.lotId) === selectedId);
+    if (!model) continue;
+    // Rendered tile geometry may be clipped or simplified. Use the canonical
+    // floor footprint so picked edge indices match the editable face groups.
+    const polygons = polygonsFromGeometry(modelFootprintForFloor(model, Number(hit.properties.floor) || 1));
     const base = Number(hit.properties.base) || 0; const height = Number(hit.properties.height) || 0;
     for (let polygonIndex = 0; polygonIndex < polygons.length; polygonIndex += 1) {
       const ring = polygons[polygonIndex][0];
@@ -1060,10 +1589,35 @@ function raycastEditableWall(point) {
   return null;
 }
 
-function getModelFootprint(model) {
-  const ratio = Math.max(0.05, 1 - model.values.freeArea / 100);
-  const base = scaleGeometry(model.feature.geometry, Math.sqrt(ratio));
-  return applyWallOffsets(base, state.wallEdits.get(model.values.lotId) || {});
+function projectFaceDragAxis(geometry, face, altitude) {
+  const ring = polygonsFromGeometry(geometry)[face.polygonIndex]?.[0];
+  if (!ring || !face.edges.length) return null;
+  const ccw = ringSignedAreaMeters(ring) > 0;
+  let normalX = 0; let normalY = 0; let centerX = 0; let centerY = 0; let totalLength = 0;
+  for (const edge of face.edges) {
+    const a = ring[edge.edgeIndex]; const b = ring[(edge.edgeIndex + 1) % (ring.length - 1)];
+    if (!a || !b) continue;
+    const middle = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+    const normal = edgeNormalMeters(a, b, middle[1], ccw);
+    const weight = edge.length;
+    normalX += normal[0] * weight; normalY += normal[1] * weight;
+    centerX += middle[0] * weight; centerY += middle[1] * weight;
+    totalLength += weight;
+  }
+  const normalLength = Math.hypot(normalX, normalY);
+  if (normalLength < 1e-6 || totalLength <= 0) return null;
+  const center = [centerX / totalLength, centerY / totalLength];
+  const normal = [normalX / normalLength, normalY / normalLength];
+  const outside = [center[0] + normal[0] / (111320 * Math.cos((center[1] * Math.PI) / 180)), center[1] + normal[1] / 110540];
+  const a = projectModelPoint(center, altitude); const b = projectModelPoint(outside, altitude);
+  const dx = b.x - a.x; const dy = b.y - a.y; const pxPerMeter = Math.hypot(dx, dy);
+  if (pxPerMeter < 0.05) return null;
+  return { normalScreen: [dx / pxPerMeter, dy / pxPerMeter], pxPerMeter };
+}
+
+function getModelFootprint(model, zoneIndex = 0) {
+  const context = modelFaceContext(model, zoneIndex);
+  return applyWallOffsets(context.base || getModelBaseFootprint(model), state.wallEdits.get(context.editKey) || {});
 }
 
 function setSelectedFaceOverlay() {
@@ -1072,29 +1626,41 @@ function setSelectedFaceOverlay() {
   const selected = state.selectedWall;
   const model = selected && state.modelInputs.find((item) => String(item.values.lotId) === selected.lotId);
   if (!model) { source.setData(emptyCollection()); return; }
-  const geometry = getModelFootprint(model);
-  const polygon = polygonsFromGeometry(geometry)[selected.polygonIndex];
-  const ring = polygon?.[0];
-  const a = ring?.[selected.edgeIndex]; const b = ring?.[selected.edgeIndex + 1];
-  if (!a || !b) { source.setData(emptyCollection()); return; }
-  const ccw = ringSignedAreaMeters(ring) > 0;
-  const middleLat = (a[1] + b[1]) / 2;
-  const normal = edgeNormalMeters(a, b, middleLat, ccw);
-  const outside = (point) => [point[0] + normal[0] * 0.12 / (111320 * Math.cos((point[1] * Math.PI) / 180)), point[1] + normal[1] * 0.12 / 110540];
-  const modelHeight = Number(state.modelEdits.get(selected.lotId) ?? Math.min(model.values.height, model.values.floors * model.values.floorHeight));
-  source.setData({ type: "FeatureCollection", features: [{
-    type: "Feature", properties: { base: 0, height: modelHeight, color: "#00b8ff" },
-    geometry: { type: "Polygon", coordinates: [[a, b, outside(b), outside(a), a]] },
-  }] });
+  const geometry = getModelFootprint(model, selected.zoneIndex || 0);
+  const features = [];
+  const polygons = polygonsFromGeometry(geometry);
+  const group = buildEditableFaceGroups(modelFaceContext(model, selected.zoneIndex || 0).base).find((face) => face.key === selected.faceKey) || {
+    edges: [{ polygonIndex: selected.polygonIndex, edgeIndex: selected.edgeIndex }],
+  };
+  for (const edge of group.edges) {
+    const ring = polygons[edge.polygonIndex]?.[0];
+    const a = ring?.[edge.edgeIndex]; const b = ring?.[(edge.edgeIndex + 1) % (ring?.length - 1 || 1)];
+    if (!a || !b) continue;
+    const ccw = ringSignedAreaMeters(ring) > 0;
+    const normal = edgeNormalMeters(a, b, (a[1] + b[1]) / 2, ccw);
+    const outside = (point) => [point[0] + normal[0] * 0.12 / (111320 * Math.cos((point[1] * Math.PI) / 180)), point[1] + normal[1] * 0.12 / 110540];
+    features.push({ type: "Feature", properties: { base: 0, color: "#00b8ff" }, geometry: { type: "Polygon", coordinates: [[a, b, outside(b), outside(a), a]] } });
+  }
+  const modelHeight = modelCurrentHeight(model);
+  const zone = (state.shapeZones.get(selected.lotId) || [])[selected.zoneIndex - 1];
+  for (const feature of features) {
+    feature.properties.base = zone ? (zone.start - 1) * model.values.floorHeight : 0;
+    feature.properties.height = zone ? Math.min(modelHeight, zone.end * model.values.floorHeight) : modelHeight;
+  }
+  source.setData({ type: "FeatureCollection", features });
 }
 
 function modelMaximumHeight(model) {
   if (!model) return 0.5;
   const normativeHeight = Number(model.values.height) || Number(model.values.floors) * Number(model.values.floorHeight);
-  const footprintArea = featureArea({ geometry: getModelFootprint(model), properties: { area_m2: 0 } });
-  const ceFloors = Math.floor((model.values.lotArea * model.values.authorizedCe) / Math.max(footprintArea, 0.01) + 1e-7);
-  const heightFloors = Math.floor(normativeHeight / model.values.floorHeight + 1e-7);
-  return Math.max(0.5, Math.min(normativeHeight, Math.max(1, Math.min(ceFloors, heightFloors)) * model.values.floorHeight));
+  const heightFloors = Math.max(1, Math.floor(normativeHeight / model.values.floorHeight + 1e-7));
+  let roofed = 0; let count = 0;
+  for (let floor = 1; floor <= heightFloors; floor += 1) {
+    const area = featureArea({ geometry: modelFootprintForFloor(model, floor), properties: { area_m2: 0 } });
+    if (roofed + area > model.values.lotArea * model.values.authorizedCe + 0.05) break;
+    roofed += area; count += 1;
+  }
+  return Math.max(0.5, Math.min(normativeHeight, Math.max(1, count) * model.values.floorHeight));
 }
 
 function modelMaximumFloors(model) {
@@ -1150,6 +1716,18 @@ function setModelPreviewActive(active) {
   const mapShell = document.querySelector(".map-shell");
   if (active) {
     if (!state.ready || !ui.modelEditorPreview || !ui.mapCanvas) return;
+    map.stop();
+    state.modelPreviewCamera = { center: map.getCenter().toArray(), zoom: map.getZoom(), pitch: map.getPitch(), bearing: map.getBearing() };
+    const backdrop = $("modelMapBackdrop");
+    try {
+      backdrop.src = map.getCanvas().toDataURL("image/png");
+      backdrop.classList.remove("is-hidden");
+    } catch (error) { console.warn("No se pudo conservar la vista del mapa.", error); }
+    setDetailPanel(false);
+    ui.layersPanel.classList.add("is-hidden");
+    ui.layersButton.setAttribute("aria-expanded", "false");
+    setOpacityPanel(false);
+    ui.closeModelEditor.focus({ preventScroll: true });
     state.modelPreviewLayerVisibility = new Map();
     const previewLayers = new Set(["lot-selected-fill", "lot-selected-line", "cabida-model", "epap-model", "pushpull-face"]);
     for (const layer of map.getStyle()?.layers || []) {
@@ -1181,7 +1759,14 @@ function setModelPreviewActive(active) {
   }
   state.modelPreviewLayerVisibility = null;
   state.modelPreviewActive = false;
-  requestAnimationFrame(() => map.resize());
+  requestAnimationFrame(() => {
+    map.resize();
+    if (state.modelPreviewCamera) map.jumpTo(state.modelPreviewCamera);
+    state.modelPreviewCamera = null;
+    $("modelMapBackdrop").classList.add("is-hidden");
+    $("modelMapBackdrop").removeAttribute("src");
+    ui.togglePanel.focus({ preventScroll: true });
+  });
 }
 
 function renderModelEditor() {
@@ -1204,87 +1789,144 @@ function renderModelEditor() {
   ui.modelFloorCount.textContent = model ? String(currentFloors) : "—";
   ui.modelFloorDown.disabled = !model || currentFloors <= 1;
   ui.modelFloorUp.disabled = !model || currentFloors >= maxFloors;
-  const footprintArea = model ? featureArea({ geometry: getModelFootprint(model), properties: { area_m2: 0 } }) : null;
+  const footprintArea = model ? featureArea({ geometry: modelFootprintForFloor(model, 1), properties: { area_m2: 0 } }) : null;
+  const roofedArea = model ? Array.from({ length: currentFloors }, (_, index) => featureArea({ geometry: modelFootprintForFloor(model, index + 1), properties: { area_m2: 0 } })).reduce((sum, area) => sum + area, 0) : null;
+  ui.modelLotArea.textContent = model ? nf0.format(model.values.lotArea) : "—";
+  ui.modelLotZone.textContent = model ? `Zona ${state.selectedFeature.properties.zona}` : "Zona —";
+  const parcelFaces = state.selectedFeature ? buildEditableFaceGroups(state.selectedFeature.geometry) : [];
+  const parcelSettings = state.parcelFaces.get(id) || {};
+  ui.modelParcelFaces.innerHTML = parcelFaces.map((face, index) => {
+    const active = parcelSettings[face.key]?.active;
+    return `<button type="button" class="model-face-option${state.selectedParcelFace === face.key ? " is-selected" : ""}" data-parcel-face="${face.key}"><strong>Cara ${String(index + 1).padStart(2, "0")}${active ? " · Frente" : ""}</strong><span>${nf1.format(face.length)} m</span></button>`;
+  }).join("");
+  const parcelFace = parcelFaces.find((face) => face.key === state.selectedParcelFace);
+  ui.modelParcelFaceControls.classList.toggle("is-hidden", !parcelFace);
+  if (parcelFace) {
+    const setting = parcelSettings[parcelFace.key] || {};
+    ui.modelParcelActiveFront.checked = Boolean(setting.active);
+    ui.modelParcelRoadWidth.value = String(setting.width ?? Number(ui.roadWidth.value) ?? 8);
+    ui.modelParcelRetreat.value = String(setting.retreat ?? Number(ui.retreat.value) ?? 0);
+  }
   ui.modelFootprintArea.textContent = footprintArea != null ? nf0.format(footprintArea) : "—";
-  ui.modelRoofedArea.textContent = footprintArea != null ? nf0.format(footprintArea * currentFloors) : "—";
-  ui.modelFreeArea.textContent = model ? nf1.format(model.values.freeArea) : "—";
+  ui.modelRoofedArea.textContent = roofedArea != null ? nf0.format(roofedArea) : "—";
+  ui.modelFreeArea.textContent = model ? `${nf1.format(model.values.freeArea)}% área libre mín.` : "—";
+  ui.modelProgramFreeArea.textContent = model ? nf0.format(Math.max(0, model.values.lotArea - footprintArea)) : "—";
+  ui.modelProgramRoofedArea.textContent = roofedArea != null ? nf0.format(roofedArea) : "—";
+  ui.modelProgramCe.textContent = model && roofedArea != null ? nf1.format(roofedArea / Math.max(0.01, model.values.lotArea)) : "—";
+  ui.modelProgramUse.value = state.currentUse;
+  ui.modelProgramUse.disabled = ui.use.disabled;
+  const zones = state.shapeZones.get(id) || [];
+  state.selectedShapeZone = clamp(state.selectedShapeZone, 0, zones.length);
+  ui.modelShapeZone.innerHTML = `<option value="0">Forma base · todos los pisos</option>${zones.map((zone, index) => `<option value="${index + 1}">Zona ${index + 1} · pisos ${zone.start}–${zone.end}</option>`).join("")}`;
+  ui.modelShapeZone.value = String(state.selectedShapeZone);
+  ui.modelRemoveShapeZone.disabled = !model || state.selectedShapeZone === 0;
+  ui.modelAddShapeZone.disabled = !model || zones.length >= currentFloors;
+  const selectedShape = state.selectedShapeZone ? zones[state.selectedShapeZone - 1] : state.modelShapes.get(id) || { type: "lot", orientation: 0 };
+  ui.modelShapeStart.value = String(selectedShape?.start || 1);
+  ui.modelShapeEnd.value = String(selectedShape?.end || currentFloors || 1);
+  ui.modelShapeStart.max = String(currentFloors || 1);
+  ui.modelShapeEnd.max = String(currentFloors || 1);
+  ui.modelShapeStart.disabled = !model || state.selectedShapeZone === 0;
+  ui.modelShapeEnd.disabled = !model || state.selectedShapeZone === 0;
+  ui.modelShapeOrientation.value = String(selectedShape.orientation || 0);
+  ui.modelShapeOrientation.disabled = !model || selectedShape.type === "lot";
+  const shapeFields = {
+    l: [["body", "Cuerpo (%)", 42], ["arm", "Brazo (%)", 42]],
+    u: [["body", "Cuerpo (%)", 36], ["leftArm", "Brazo izquierdo (%)", 27], ["rightArm", "Brazo derecho (%)", 27]],
+    patio: [["front", "Frente (%)", 25], ["back", "Fondo (%)", 25], ["leftArm", "Lado izquierdo (%)", 25], ["rightArm", "Lado derecho (%)", 25]],
+    blocks: [["gap", "Separación (%)", 20]],
+  }[selectedShape.type] || [];
+  ui.modelShapeParams.innerHTML = shapeFields.map(([key, label, fallback]) => `<label>${label}<input type="number" data-shape-param="${key}" min="10" max="70" step="1" value="${selectedShape[key] ?? fallback}" /></label>`).join("");
+  ui.modelShapeOptions.querySelectorAll("[data-model-shape]").forEach((button) => {
+    const active = button.dataset.modelShape === selectedShape.type;
+    button.classList.toggle("is-selected", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
   ui.modelRulesSummary.textContent = model
     ? `Zona ${state.selectedFeature.properties.zona} · C.E. base ${nf1.format(model.values.ceBase)} · C.E. autorizable ${nf1.format(model.values.authorizedCe)} · C.E. máximo ${nf1.format(model.values.ceMax)} · altura calculada ${nf1.format(model.values.height)} m. Máximo operativo: ${maxFloors} pisos sobre la huella actual.`
     : "Este lote no tiene parámetros edificatorios disponibles.";
-  ui.restoreLotModel.disabled = !model || (!state.modelEdits.has(id) && !Object.keys(state.wallEdits.get(id) || {}).length);
-  const edges = [];
-  if (model) {
-    const geometry = getModelFootprint(model);
-    polygonsFromGeometry(geometry).forEach((polygon, polygonIndex) => {
-      const ring = polygon[0];
-      for (let edgeIndex = 0; ring && edgeIndex < ring.length - 1; edgeIndex += 1) {
-        const a = ring[edgeIndex]; const b = ring[edgeIndex + 1];
-        const midLat = (a[1] + b[1]) / 2;
-        const length = Math.hypot((b[0] - a[0]) * 111320 * Math.cos((midLat * Math.PI) / 180), (b[1] - a[1]) * 110540);
-        edges.push({ polygonIndex, edgeIndex, key: `${polygonIndex}:${edgeIndex}`, length });
-      }
-    });
+  ui.restoreLotModel.disabled = !model || (!state.modelEdits.has(id) && !Object.keys(state.wallEdits.get(id) || {}).length && ![...state.wallEdits.keys()].some((key) => key.startsWith(`${id}@`)) && !(state.modelShapes.get(id)?.type && state.modelShapes.get(id).type !== "lot") && !zones.length && !Object.keys(state.floorUses.get(id) || {}).length && !Object.keys(state.parcelFaces.get(id) || {}).length);
+  const floorUses = state.floorUses.get(id) || {};
+  const areaByUse = { residencial: 0, comercial: 0, equipamiento: 0 };
+  ui.modelFloorUses.innerHTML = model ? Array.from({ length: currentFloors }, (_, index) => {
+    const floor = index + 1;
+    const use = Object.hasOwn(areaByUse, floorUses[floor]) ? floorUses[floor] : "residencial";
+    return `<label>Piso ${floor}<select data-floor-use="${floor}"><option value="residencial"${use === "residencial" ? " selected" : ""}>Residencial</option><option value="comercial"${use === "comercial" ? " selected" : ""}>Comercial</option><option value="equipamiento"${use === "equipamiento" ? " selected" : ""}>Equipamiento</option></select></label>`;
+  }).join("") : "";
+  if (model) for (let floor = 1; floor <= currentFloors; floor += 1) {
+    const use = Object.hasOwn(areaByUse, floorUses[floor]) ? floorUses[floor] : "residencial";
+    areaByUse[use] += featureArea({ geometry: modelFootprintForFloor(model, floor), properties: { area_m2: 0 } });
   }
-  ui.modelFaceCount.textContent = `${edges.length} caras`;
-  ui.modelFaceList.innerHTML = edges.map((edge, index) => {
-    const active = state.selectedWall?.lotId === id && state.selectedWall.edgeKey === edge.key;
-    const offset = Number(state.wallEdits.get(id)?.[edge.key]) || 0;
-    return `<button type="button" class="model-face-option${active ? " is-selected" : ""}" data-face-key="${edge.key}" aria-pressed="${active}"><strong>${`Cara ${String(index + 1).padStart(2, "0")}`}</strong><span>${nf1.format(edge.length)} m · ${offset >= 0 ? "+" : ""}${nf1.format(offset)} m</span></button>`;
+  ui.modelUseAreas.innerHTML = Object.entries(areaByUse).map(([use, area]) => `<span><b>${use[0].toUpperCase() + use.slice(1)}</b>${nf0.format(area)} m²</span>`).join("");
+  const faceContext = model ? modelFaceContext(model, state.selectedShapeZone) : null;
+  const faces = faceContext?.base ? buildEditableFaceGroups(faceContext.base) : [];
+  ui.modelFaceCount.textContent = `${faces.length} caras completas · ${state.selectedShapeZone ? `zona ${state.selectedShapeZone}` : "forma base"}`;
+  ui.modelFaceList.innerHTML = faces.map((face, index) => {
+    const active = state.selectedWall?.lotId === id && state.selectedWall.zoneIndex === state.selectedShapeZone && state.selectedWall.faceKey === face.key;
+    const offset = averageFaceOffset(state.wallEdits.get(faceContext.editKey) || {}, face);
+    return `<button type="button" class="model-face-option${active ? " is-selected" : ""}" data-face-key="${face.key}" aria-pressed="${active}"><strong>${`Cara ${String(index + 1).padStart(2, "0")}`}</strong><span>${nf1.format(face.length)} m · ${offset >= 0 ? "+" : ""}${nf1.format(offset)} m</span></button>`;
   }).join("");
   ui.modelFaceList.querySelectorAll("[data-face-key]").forEach((button) => button.addEventListener("click", () => {
-    const [polygonIndex, edgeIndex] = button.dataset.faceKey.split(":").map(Number);
-    const edge = edges.find((item) => item.key === button.dataset.faceKey);
-    state.selectedWall = { lotId: id, edgeKey: button.dataset.faceKey, polygonIndex, edgeIndex };
-    state.modelDimension = edge ? { lotId: id, value: edge.length } : null;
+    const face = faces.find((item) => item.key === button.dataset.faceKey);
+    const first = face?.edges[0];
+    state.selectedWall = face ? { lotId: id, editKey: faceContext.editKey, zoneIndex: state.selectedShapeZone, faceKey: face.key, edgeKeys: face.edges.map((edge) => edge.key), polygonIndex: first.polygonIndex, edgeIndex: first.edgeIndex } : null;
+    state.modelDimension = face ? { lotId: id, value: face.length } : null;
     renderModelEditor(); setSelectedFaceOverlay();
-    if (edge) ui.modelDimension.textContent = nf1.format(edge.length);
+    if (face) ui.modelDimension.textContent = nf1.format(face.length);
   }));
-  const selectedEdge = edges.find((edge) => state.selectedWall?.lotId === id && state.selectedWall.edgeKey === edge.key);
-  ui.modelFaceControls.classList.toggle("is-hidden", !selectedEdge);
-  if (selectedEdge) {
-    const offset = Number(state.wallEdits.get(id)?.[selectedEdge.key]) || 0;
-    ui.modelSelectedFace.textContent = `Cara ${String(edges.indexOf(selectedEdge) + 1).padStart(2, "0")}`;
-    ui.modelSelectedFaceLength.textContent = `${nf1.format(selectedEdge.length)} m`;
+  const selectedFace = faces.find((face) => state.selectedWall?.lotId === id && state.selectedWall.zoneIndex === state.selectedShapeZone && state.selectedWall.faceKey === face.key);
+  ui.modelFaceControls.classList.toggle("is-hidden", !selectedFace);
+  if (selectedFace) {
+    const faceIndex = faces.indexOf(selectedFace);
+    const offset = averageFaceOffset(state.wallEdits.get(faceContext.editKey) || {}, selectedFace);
+    ui.modelSelectedFace.textContent = `Cara ${String(faceIndex + 1).padStart(2, "0")}`;
+    ui.modelSelectedFaceLength.textContent = `${nf1.format(selectedFace.length)} m · lado completo`;
     ui.modelFaceOffset.value = String(offset); ui.modelFaceOffsetNumber.value = String(Number(offset.toFixed(1)));
     ui.modelFaceLimitHint.textContent = "El deslizador respeta el área ocupable y el contorno del lote.";
   }
   setSelectedFaceOverlay();
 }
 
-function applyWallOffsetEdit(id, edgeKey, desiredValue) {
+function applyWallOffsetEdit(id, desiredValue) {
   const model = state.modelInputs.find((item) => String(item.values.lotId) === id);
   if (!model) return null;
-  const offsets = { ...(state.wallEdits.get(id) || {}) };
-  const currentValue = Number(offsets[edgeKey]) || 0;
-  const ratio = Math.max(0.05, 1 - model.values.freeArea / 100);
-  const base = scaleGeometry(model.feature.geometry, Math.sqrt(ratio));
-  const desired = clamp(Number(desiredValue) || 0, -25, 25);
-  const next = constrainWallOffset(model, base, edgeKey, currentValue, desired, offsets);
-  if (Math.abs(next) < 0.005) delete offsets[edgeKey]; else offsets[edgeKey] = next;
-  if (Object.keys(offsets).length) state.wallEdits.set(id, offsets); else state.wallEdits.delete(id);
+  const context = modelFaceContext(model, state.selectedWall?.zoneIndex || 0);
+  const before = { ...(state.pendingWallControl?.editKey === context.editKey ? state.pendingWallControl.beforeOffsets : state.wallEdits.get(context.editKey) || {}) };
+  const base = context.base;
+  const face = buildEditableFaceGroups(base).find((item) => item.key === (state.pendingWallControl?.faceKey || state.selectedWall?.faceKey));
+  if (!face) return null;
+  const result = constrainWallFaceOffsets(model, base, face, before, desiredValue);
+  const offsets = result.offsets;
+  if (Object.keys(offsets).length) state.wallEdits.set(context.editKey, offsets); else state.wallEdits.delete(context.editKey);
   updateCalculation();
-  return next;
+  return result.value;
 }
 
 function beginWallControlEdit() {
   if (!state.selectedWall) return;
-  const offsets = state.wallEdits.get(state.selectedWall.lotId) || {};
-  state.pendingWallControl = { ...state.selectedWall, before: Number(offsets[state.selectedWall.edgeKey]) || 0 };
+  const offsets = state.wallEdits.get(state.selectedWall.editKey) || {};
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === state.selectedWall.lotId);
+  const face = model && buildEditableFaceGroups(modelFaceContext(model, state.selectedWall.zoneIndex).base).find((item) => item.key === state.selectedWall.faceKey);
+  if (!face) return;
+  state.pendingWallControl = { ...state.selectedWall, beforeOffsets: { ...offsets }, before: averageFaceOffset(offsets, face) };
 }
 
 function changeWallControl(event) {
   if (!state.selectedWall) return;
   if (!state.pendingWallControl) beginWallControlEdit();
-  const next = applyWallOffsetEdit(state.selectedWall.lotId, state.selectedWall.edgeKey, event.currentTarget.value);
+  const next = applyWallOffsetEdit(state.selectedWall.lotId, event.currentTarget.value);
   if (next != null) event.currentTarget.value = String(Number(next.toFixed(1)));
 }
 
 function commitWallControlEdit() {
   const pending = state.pendingWallControl; state.pendingWallControl = null;
   if (!pending) return;
-  const after = Number(state.wallEdits.get(pending.lotId)?.[pending.edgeKey]) || 0;
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === pending.lotId);
+  const face = model && buildEditableFaceGroups(modelFaceContext(model, pending.zoneIndex).base).find((item) => item.key === pending.faceKey);
+  const afterOffsets = { ...(state.wallEdits.get(pending.editKey) || {}) };
+  const after = face ? averageFaceOffset(afterOffsets, face) : pending.before;
   if (Math.abs(after - pending.before) < 0.02) return;
-  state.modelEditUndo.push({ type: "wall", id: pending.lotId, edgeKey: pending.edgeKey, before: pending.before || null, after });
+  state.modelEditUndo.push({ type: "wall-group", id: pending.lotId, editKey: pending.editKey, before: pending.beforeOffsets, after: afterOffsets });
   state.modelEditRedo = []; persistModelEdits(); syncModelEditHistoryButtons();
 }
 
@@ -1294,8 +1936,8 @@ function changeNumericWallControl(event) {
 }
 
 function syncModelEditHistoryButtons() {
-  ui.undoModelEdit.disabled = state.modelEditUndo.length === 0;
-  ui.redoModelEdit.disabled = state.modelEditRedo.length === 0;
+  if (ui.undoModelEdit) ui.undoModelEdit.disabled = state.modelEditUndo.length === 0;
+  if (ui.redoModelEdit) ui.redoModelEdit.disabled = state.modelEditRedo.length === 0;
 }
 
 function applyModelEdit(entry, direction) {
@@ -1305,10 +1947,34 @@ function applyModelEdit(entry, direction) {
     else state.modelEdits.set(entry.id, value.height);
     if (value?.walls && Object.keys(value.walls).length) state.wallEdits.set(entry.id, { ...value.walls });
     else state.wallEdits.delete(entry.id);
+    for (const key of [...state.wallEdits.keys()].filter((key) => key.startsWith(`${entry.id}@`))) state.wallEdits.delete(key);
+    for (const [key, offsets] of Object.entries(value?.zoneWalls || {})) state.wallEdits.set(key, { ...offsets });
+    if (value?.shape && value.shape.type !== "lot") state.modelShapes.set(entry.id, { ...value.shape }); else state.modelShapes.delete(entry.id);
+    if (value?.zones?.length) state.shapeZones.set(entry.id, value.zones.map((zone) => ({ ...zone }))); else state.shapeZones.delete(entry.id);
+    if (value?.uses && Object.keys(value.uses).length) state.floorUses.set(entry.id, { ...value.uses }); else state.floorUses.delete(entry.id);
+    if (value?.parcel && Object.keys(value.parcel).length) state.parcelFaces.set(entry.id, { ...value.parcel }); else state.parcelFaces.delete(entry.id);
+  } else if (entry.type === "shape-zones") {
+    if (value?.length) state.shapeZones.set(entry.id, value.map((zone) => ({ ...zone }))); else state.shapeZones.delete(entry.id);
+    if (entry.zoneWallKey) {
+      const offsets = direction === "undo" ? entry.beforeWall : entry.afterWall;
+      if (offsets && Object.keys(offsets).length) state.wallEdits.set(entry.zoneWallKey, { ...offsets });
+      else state.wallEdits.delete(entry.zoneWallKey);
+    }
+  } else if (entry.type === "floor-use") {
+    if (value && Object.keys(value).length) state.floorUses.set(entry.id, { ...value }); else state.floorUses.delete(entry.id);
+  } else if (entry.type === "parcel-face") {
+    if (value && Object.keys(value).length) state.parcelFaces.set(entry.id, structuredClone(value)); else state.parcelFaces.delete(entry.id);
+    applyActiveParcelFront(entry.id);
+  } else if (entry.type === "morphology") {
+    if (value?.shape && value.shape.type !== "lot") state.modelShapes.set(entry.id, { ...value.shape }); else state.modelShapes.delete(entry.id);
+    if (value?.walls && Object.keys(value.walls).length) state.wallEdits.set(entry.id, { ...value.walls }); else state.wallEdits.delete(entry.id);
   } else if (entry.type === "wall") {
     const offsets = { ...(state.wallEdits.get(entry.id) || {}) };
     if (value == null) delete offsets[entry.edgeKey]; else offsets[entry.edgeKey] = value;
     if (Object.keys(offsets).length) state.wallEdits.set(entry.id, offsets); else state.wallEdits.delete(entry.id);
+  } else if (entry.type === "wall-group") {
+    const editKey = entry.editKey || entry.id;
+    if (value && Object.keys(value).length) state.wallEdits.set(editKey, { ...value }); else state.wallEdits.delete(editKey);
   } else if (value == null) state.modelEdits.delete(entry.id);
   else state.modelEdits.set(entry.id, value);
   updateMapModel(state.modelInputs);
@@ -1332,10 +1998,21 @@ function restoreSelectedLotModel() {
   const before = {
     height: state.modelEdits.has(id) ? state.modelEdits.get(id) : null,
     walls: { ...(state.wallEdits.get(id) || {}) },
+    zoneWalls: Object.fromEntries([...state.wallEdits].filter(([key]) => key.startsWith(`${id}@`)).map(([key, offsets]) => [key, { ...offsets }])),
+    shape: state.modelShapes.has(id) ? { ...state.modelShapes.get(id) } : null,
+    zones: (state.shapeZones.get(id) || []).map((zone) => ({ ...zone })),
+    uses: { ...(state.floorUses.get(id) || {}) },
+    parcel: structuredClone(state.parcelFaces.get(id) || {}),
   };
-  if (before.height == null && !Object.keys(before.walls).length) return;
+  if (before.height == null && !Object.keys(before.walls).length && !Object.keys(before.zoneWalls).length && !before.shape && !before.zones.length && !Object.keys(before.uses).length && !Object.keys(before.parcel).length) return;
   state.modelEdits.delete(id);
   state.wallEdits.delete(id);
+  for (const key of Object.keys(before.zoneWalls)) state.wallEdits.delete(key);
+  state.modelShapes.delete(id);
+  state.shapeZones.delete(id);
+  state.floorUses.delete(id);
+  state.parcelFaces.delete(id);
+  detectRoads(state.selectedFeature);
   state.selectedWall = null;
   state.modelDimension = null;
   updateCalculation();
@@ -1343,6 +2020,146 @@ function restoreSelectedLotModel() {
   state.modelEditRedo = [];
   persistModelEdits();
   syncModelEditHistoryButtons();
+}
+
+function applyModelMorphology(type, orientation = null) {
+  const id = String(state.selectedFeature?.properties.id || "");
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === id);
+  if (!model) return;
+  if (state.selectedShapeZone > 0) {
+    const zones = (state.shapeZones.get(id) || []).map((zone) => ({ ...zone }));
+    const index = state.selectedShapeZone - 1;
+    const previous = zones[index];
+    if (!previous) return;
+    const nextZone = { ...previous, type, orientation: clamp(Number(orientation ?? previous.orientation) || 0, 0, 3) };
+    const footprint = buildModelBaseFootprint(model, nextZone);
+    const maxArea = model.values.lotArea * Math.max(0.05, 1 - model.values.freeArea / 100);
+    if (!footprint || !footprintRespectsLotAndArea(footprint, model.feature.geometry, maxArea, footprint)) {
+      ui.modelFaceLimitHint.textContent = "La forma no cabe dentro del lote seleccionado.";
+      return;
+    }
+    const before = zones.map((zone) => ({ ...zone }));
+    const zoneWallKey = `${id}@${previous.id}`;
+    const beforeWall = { ...(state.wallEdits.get(zoneWallKey) || {}) };
+    zones[index] = nextZone;
+    state.shapeZones.set(id, zones);
+    state.wallEdits.delete(zoneWallKey);
+    state.modelEditUndo.push({ type: "shape-zones", id, before, after: zones.map((zone) => ({ ...zone })), zoneWallKey, beforeWall, afterWall: {} });
+    state.modelEditRedo = [];
+    persistModelEdits(); syncModelEditHistoryButtons(); updateCalculation();
+    return;
+  }
+  const current = state.modelShapes.get(id) || { type: "lot", orientation: 0 };
+  const hadShape = state.modelShapes.has(id);
+  const next = { type, orientation: clamp(Number(orientation ?? current.orientation) || 0, 0, 3) };
+  if (type !== "lot" && !morphologyTemplate(type)) return;
+  if (type === current.type && next.orientation === current.orientation) return;
+  const before = { shape: { ...current }, walls: { ...(state.wallEdits.get(id) || {}) } };
+  state.modelShapes.set(id, next);
+  if (type !== current.type || next.orientation !== current.orientation) state.wallEdits.delete(id);
+  const base = buildModelBaseFootprint(model);
+  const maxFootprintArea = model.values.lotArea * Math.max(0.05, 1 - model.values.freeArea / 100);
+  if (!base || !footprintRespectsLotAndArea(base, model.feature.geometry, maxFootprintArea, base)) {
+    if (hadShape) state.modelShapes.set(id, current); else state.modelShapes.delete(id);
+    if (Object.keys(before.walls).length) state.wallEdits.set(id, before.walls); else state.wallEdits.delete(id);
+    renderModelEditor();
+    ui.modelFaceLimitHint.textContent = "Esta forma no cabe en el lote con la ocupación permitida. Prueba otra orientación o forma.";
+    return;
+  }
+  state.selectedWall = null;
+  state.modelDimension = null;
+  updateCalculation();
+  const after = { shape: { ...next }, walls: { ...(state.wallEdits.get(id) || {}) } };
+  state.modelEditUndo.push({ type: "morphology", id, before, after });
+  state.modelEditRedo = [];
+  persistModelEdits(); syncModelEditHistoryButtons();
+}
+
+function editShapeZoneRange(field, rawValue) {
+  const id = String(state.selectedFeature?.properties.id || "");
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === id);
+  const zones = (state.shapeZones.get(id) || []).map((zone) => ({ ...zone }));
+  const index = state.selectedShapeZone - 1;
+  if (!model || !zones[index]) return;
+  const before = zones.map((zone) => ({ ...zone }));
+  const max = Math.ceil(modelCurrentHeight(model) / model.values.floorHeight);
+  zones[index][field] = clamp(Math.round(Number(rawValue) || 1), 1, max);
+  if (zones[index].start > zones[index].end || zones.some((zone, other) => other !== index && zone.start <= zones[index].end && zone.end >= zones[index].start)) {
+    renderModelEditor(); return;
+  }
+  state.shapeZones.set(id, zones);
+  state.modelEditUndo.push({ type: "shape-zones", id, before, after: zones.map((zone) => ({ ...zone })) });
+  state.modelEditRedo = []; persistModelEdits(); syncModelEditHistoryButtons(); updateCalculation();
+}
+
+function applyModelShapeParameter(key, rawValue) {
+  const id = String(state.selectedFeature?.properties.id || "");
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === id);
+  if (!model) return;
+  const zones = (state.shapeZones.get(id) || []).map((zone) => ({ ...zone }));
+  const current = state.selectedShapeZone ? zones[state.selectedShapeZone - 1] : state.modelShapes.get(id) || { type: "lot", orientation: 0 };
+  if (!current || current.type === "lot") return;
+  const next = { ...current, [key]: clamp(Number(rawValue) || 10, 10, 70) };
+  const footprint = buildModelBaseFootprint(model, next);
+  const maxArea = model.values.lotArea * Math.max(0.05, 1 - model.values.freeArea / 100);
+  if (!footprint || !footprintRespectsLotAndArea(footprint, model.feature.geometry, maxArea, footprint)) {
+    renderModelEditor(); return;
+  }
+  if (state.selectedShapeZone) {
+    const before = zones.map((zone) => ({ ...zone }));
+    const zoneWallKey = `${id}@${current.id}`;
+    const beforeWall = { ...(state.wallEdits.get(zoneWallKey) || {}) };
+    zones[state.selectedShapeZone - 1] = next;
+    state.shapeZones.set(id, zones);
+    state.wallEdits.delete(zoneWallKey);
+    state.modelEditUndo.push({ type: "shape-zones", id, before, after: zones.map((zone) => ({ ...zone })), zoneWallKey, beforeWall, afterWall: {} });
+  } else {
+    const before = { shape: { ...current }, walls: { ...(state.wallEdits.get(id) || {}) } };
+    state.modelShapes.set(id, next);
+    state.wallEdits.delete(id);
+    state.modelEditUndo.push({ type: "morphology", id, before, after: { shape: { ...next }, walls: {} } });
+  }
+  state.modelEditRedo = []; persistModelEdits(); syncModelEditHistoryButtons(); updateCalculation();
+}
+
+function applyActiveParcelFront(id) {
+  if (String(state.selectedFeature?.properties.id || "") !== id) return;
+  const front = Object.values(state.parcelFaces.get(id) || {}).find((entry) => entry.active);
+  if (front) {
+    ui.roadSelect.value = "manual";
+    ui.roadWidth.readOnly = false;
+    ui.roadWidth.value = front.width;
+    ui.retreat.value = front.retreat;
+    ui.roadSourceMeta.textContent = "Frente configurado por cara del predio en PREDIAL · Lote.";
+  } else {
+    ui.retreat.value = Number(state.selectedFeature.properties.retiro_frontal) > 0 ? Number(state.selectedFeature.properties.retiro_frontal) : 0;
+    detectRoads(state.selectedFeature);
+  }
+  updateCalculation();
+}
+
+function saveParcelFaceSetting(changes) {
+  const id = String(state.selectedFeature?.properties.id || "");
+  const key = state.selectedParcelFace;
+  if (!id || !key) return;
+  const before = structuredClone(state.parcelFaces.get(id) || {});
+  const after = structuredClone(before);
+  if (changes.active) for (const setting of Object.values(after)) setting.active = false;
+  after[key] = { width: clamp(Number(ui.modelParcelRoadWidth.value) || 8, 6, 80), retreat: clamp(Number(ui.modelParcelRetreat.value) || 0, 0, 30), ...(after[key] || {}), ...changes };
+  state.parcelFaces.set(id, after);
+  state.modelEditUndo.push({ type: "parcel-face", id, before, after });
+  state.modelEditRedo = []; persistModelEdits(); syncModelEditHistoryButtons();
+  applyActiveParcelFront(id);
+}
+
+function selectModelEditorTab(tab) {
+  state.modelEditorTab = tab;
+  document.querySelectorAll("[data-model-tab]").forEach((button) => {
+    const active = button.dataset.modelTab === tab;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  document.querySelectorAll("[data-model-panel]").forEach((panel) => panel.classList.toggle("is-hidden", panel.dataset.modelPanel !== tab));
 }
 
 function finishModelDrag() {
@@ -1356,15 +2173,18 @@ function finishModelDrag() {
     state.suppressNextMapClick = true;
     window.setTimeout(() => { state.suppressNextMapClick = false; }, 0);
   }
-  const after = drag.type === "wall" ? Number(state.wallEdits.get(drag.id)?.[drag.edgeKey] || 0) : state.modelEdits.get(drag.id);
-  if (Number.isFinite(after) && Math.abs(after - drag.startValue) >= 0.02) {
+  const after = drag.type === "wall" ? averageFaceOffset(state.wallEdits.get(drag.editKey) || {}, drag.face) : state.modelEdits.get(drag.id);
+  if (drag.type === "wall" && Math.abs(after - drag.startValue) >= 0.02) {
+    state.modelEditUndo.push({ type: "wall-group", id: drag.id, editKey: drag.editKey, before: drag.startOffsets, after: { ...(state.wallEdits.get(drag.editKey) || {}) } });
+    state.modelEditRedo = [];
+  } else if (drag.type !== "wall" && Number.isFinite(after) && Math.abs(after - drag.startValue) >= 0.02) {
     state.modelEditUndo.push({ type: drag.type, id: drag.id, edgeKey: drag.edgeKey, before: drag.beforeOverride, after });
     state.modelEditRedo = [];
+  } else if (drag.type === "wall") {
+    const offsets = { ...(drag.startOffsets || {}) };
+    if (Object.keys(offsets).length) state.wallEdits.set(drag.editKey, offsets); else state.wallEdits.delete(drag.editKey);
   } else if (drag.beforeOverride == null) {
-    if (drag.type === "wall") {
-      const offsets = { ...(state.wallEdits.get(drag.id) || {}) }; delete offsets[drag.edgeKey];
-      if (Object.keys(offsets).length) state.wallEdits.set(drag.id, offsets); else state.wallEdits.delete(drag.id);
-    } else state.modelEdits.delete(drag.id);
+    state.modelEdits.delete(drag.id);
   }
   persistModelEdits();
   syncModelEditHistoryButtons();
@@ -1389,8 +2209,8 @@ function focusFeature(feature, animate = true) {
   map.fitBounds([[bounds[0], bounds[1]], [bounds[2], bounds[3]]], {
     padding: { top: 120, bottom: 150, left: 120, right: 120 },
     maxZoom: 18.3,
-    pitch: 60,
-    bearing: -24,
+    pitch: state.allLots3dActive ? 60 : 0,
+    bearing: state.allLots3dActive ? -24 : 0,
     duration: animate ? 900 : 0,
   });
 }
@@ -1403,7 +2223,7 @@ function focusFeatures(features, animate = true) {
   }, [Infinity, Infinity, -Infinity, -Infinity]);
   map.fitBounds([[bounds[0], bounds[1]], [bounds[2], bounds[3]]], {
     padding: { top: 120, bottom: 150, left: 120, right: 120 }, maxZoom: 18.3,
-    pitch: 60, bearing: -24, duration: animate ? 900 : 0,
+    pitch: state.allLots3dActive ? 60 : 0, bearing: state.allLots3dActive ? -24 : 0, duration: animate ? 900 : 0,
   });
 }
 
@@ -1420,48 +2240,164 @@ function fitDistrict() {
 // UI events
 // ─────────────────────────────────────────────────────────────────────────────
 
-function hideWelcome() { ui.welcome.classList.add("is-hidden"); }
-ui.enter.addEventListener("click", hideWelcome);
-ui.closeWelcome.addEventListener("click", hideWelcome);
-ui.help.addEventListener("click", () => ui.welcome.classList.remove("is-hidden"));
-
-ui.layersButton.addEventListener("click", () => ui.layersPanel.classList.toggle("is-hidden"));
-ui.closeLayers.addEventListener("click", () => ui.layersPanel.classList.add("is-hidden"));
-ui.togglePanel.addEventListener("click", () => ui.detailPanel.classList.add("is-open"));
-ui.closeDetail.addEventListener("click", () => ui.detailPanel.classList.remove("is-open"));
-ui.home.addEventListener("click", fitDistrict);
+function setDetailPanel(open) {
+  ui.detailPanel.classList.toggle("is-open", open);
+  ui.detailPanel.inert = !open;
+  document.querySelector(".map-shell").classList.toggle("has-detail-open", open);
+  ui.togglePanel.setAttribute("aria-expanded", String(open));
+  if (open) { setOpacityPanel(false); ui.closeDetail.focus({ preventScroll: true }); }
+}
+function setOpacityPanel(open) {
+  $("opacityPanel").classList.toggle("is-hidden", !open);
+  $("opacityButton").setAttribute("aria-expanded", String(open));
+}
+$("opacityButton").addEventListener("click", () => {
+  const open = $("opacityPanel").classList.contains("is-hidden");
+  ui.layersPanel.classList.add("is-hidden");
+  ui.layersButton.setAttribute("aria-expanded", "false");
+  setOpacityPanel(open);
+});
+$("closeOpacity").addEventListener("click", () => setOpacityPanel(false));
+ui.layersButton.addEventListener("click", () => {
+  setOpacityPanel(false);
+  const open = ui.layersPanel.classList.toggle("is-hidden") === false;
+  ui.layersButton.setAttribute("aria-expanded", String(open));
+});
+ui.closeLayers.addEventListener("click", () => {
+  ui.layersPanel.classList.add("is-hidden");
+  ui.layersButton.setAttribute("aria-expanded", "false");
+});
+ui.togglePanel.addEventListener("click", () => {
+  if (!ui.modelEditor.classList.contains("is-hidden")) return;
+  setDetailPanel(!ui.detailPanel.classList.contains("is-open"));
+});
+ui.closeDetail.addEventListener("click", () => {
+  setDetailPanel(false);
+  ui.togglePanel.focus({ preventScroll: true });
+});
 ui.tilt3d.addEventListener("click", () => {
-  if (state.selectedFeatures.length) focusFeatures(state.selectedFeatures, true);
-  else map.easeTo({ pitch: 60, bearing: -24, duration: 650 });
+  const activate = !state.allLots3dActive;
+  setAllLots3d(activate);
+  if (!activate) {
+    map.easeTo({ pitch: 0, bearing: 0, duration: 650 });
+  } else if (state.selectedFeatures.length) {
+    focusFeatures(state.selectedFeatures, true);
+  } else {
+    map.easeTo({ pitch: 60, bearing: -24, duration: 650 });
+  }
 });
-ui.flat2d.addEventListener("click", () => map.easeTo({ pitch: 0, bearing: 0, duration: 650 }));
+ui.flat2d.addEventListener("click", () => {
+  setAllLots3d(false);
+  map.easeTo({ pitch: 0, bearing: 0, duration: 650 });
+});
+$("modifyPolygonButton").addEventListener("click", () => {
+  if (!state.selectedFeature || state.selectedFeatures.length !== 1) return;
+  selectModelEditorTab("lot");
+  state.modelEditorOpen = true;
+  renderModelEditor();
+});
+$("resetNorthButton").addEventListener("click", () => map.easeTo({ bearing: 0, duration: 420 }));
+$("zoomInButton").addEventListener("click", () => map.zoomIn({ duration: 280 }));
+$("zoomOutButton").addEventListener("click", () => map.zoomOut({ duration: 280 }));
+map.on("moveend", () => {
+  $("resetNorthButton").style.setProperty("--map-bearing", `${-map.getBearing()}deg`);
+  const is3d = state.allLots3dActive;
+  ui.tilt3d.classList.toggle("is-active", is3d);
+  ui.flat2d.classList.toggle("is-active", !is3d);
+  ui.tilt3d.setAttribute("aria-pressed", String(is3d));
+  ui.flat2d.setAttribute("aria-pressed", String(!is3d));
+});
 
-ui.pushPull.addEventListener("click", () => {
-  if (!state.selectedFeature) {
-    ui.modelInteractionHint.textContent = "Seleccione un lote antes de activar Push/Pull.";
-    ui.mapModelHud.classList.remove("is-hidden");
-    return;
-  }
-  state.pushPullMode = !state.pushPullMode;
-  state.modelEditorOpen = state.pushPullMode && state.selectedFeatures.length === 1;
-  ui.pushPull.classList.toggle("is-active", state.pushPullMode);
-  ui.pushPull.setAttribute("aria-pressed", String(state.pushPullMode));
-  document.querySelector(".map-shell").classList.toggle("push-pull-active", state.pushPullMode);
-  if (state.pushPullMode) {
-    map.easeTo({ pitch: Math.max(map.getPitch(), 55), duration: 450 });
-    ui.modelInteractionHint.textContent = "Elija una cara en el panel y ajuste su cota, o arrástrela directamente.";
-  }
-  updateMapModel(state.modelInputs);
-});
-ui.closeModelEditor.addEventListener("click", () => {
+function setAllLots3d(active) {
+  state.allLots3dActive = Boolean(active);
+  if (map.getLayer("lots-3d")) map.setLayoutProperty("lots-3d", "visibility", state.allLots3dActive ? "visible" : "none");
+  if (map.getLayer("lots-3d-outline")) map.setLayoutProperty("lots-3d-outline", "visibility", state.allLots3dActive ? "visible" : "none");
+  if (map.getLayer("lots-fill")) map.setLayoutProperty("lots-fill", "visibility", state.allLots3dActive ? "none" : "visible");
+}
+
+function closeLotEditor() {
+  finishModelDrag();
   state.pushPullMode = false; state.selectedWall = null; state.modelDimension = null;
   ui.pushPull.classList.remove("is-active"); ui.pushPull.setAttribute("aria-pressed", "false");
   document.querySelector(".map-shell").classList.remove("push-pull-active");
   state.modelEditorOpen = false;
   ui.modelEditor.classList.add("is-hidden"); ui.modelEditorBackdrop.classList.add("is-hidden"); setSelectedFaceOverlay(); updateMapModel(state.modelInputs);
+}
+ui.closeModelEditor.addEventListener("click", closeLotEditor);
+document.querySelectorAll("[data-model-tab]").forEach((button) => button.addEventListener("click", () => selectModelEditorTab(button.dataset.modelTab)));
+ui.modelShapeOptions.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-model-shape]");
+  if (button) applyModelMorphology(button.dataset.modelShape);
 });
-ui.undoModelEdit.addEventListener("click", undoModelEdit);
-ui.redoModelEdit.addEventListener("click", redoModelEdit);
+ui.modelShapeOrientation.addEventListener("change", () => {
+  const id = String(state.selectedFeature?.properties.id || "");
+  const current = state.selectedShapeZone ? state.shapeZones.get(id)?.[state.selectedShapeZone - 1] : state.modelShapes.get(id) || { type: "lot", orientation: 0 };
+  applyModelMorphology(current.type, ui.modelShapeOrientation.value);
+});
+ui.modelShapeZone.addEventListener("change", () => {
+  state.selectedShapeZone = Number(ui.modelShapeZone.value) || 0;
+  state.selectedWall = null;
+  renderModelEditor();
+});
+ui.modelAddShapeZone.addEventListener("click", () => {
+  const id = String(state.selectedFeature?.properties.id || "");
+  const model = state.modelInputs.find((item) => String(item.values.lotId) === id);
+  if (!model) return;
+  const before = (state.shapeZones.get(id) || []).map((zone) => ({ ...zone }));
+  const floorCount = Math.ceil(modelCurrentHeight(model) / model.values.floorHeight);
+  const floor = Array.from({ length: floorCount }, (_, index) => floorCount - index).find((value) => !before.some((zone) => value >= zone.start && value <= zone.end));
+  if (!floor) return;
+  const after = [...before, { id: Date.now(), start: floor, end: floor, type: "lot", orientation: 0 }];
+  state.shapeZones.set(id, after);
+  state.selectedShapeZone = after.length;
+  state.modelEditUndo.push({ type: "shape-zones", id, before, after: after.map((zone) => ({ ...zone })) });
+  state.modelEditRedo = []; persistModelEdits(); syncModelEditHistoryButtons(); updateCalculation();
+});
+ui.modelRemoveShapeZone.addEventListener("click", () => {
+  const id = String(state.selectedFeature?.properties.id || "");
+  const before = (state.shapeZones.get(id) || []).map((zone) => ({ ...zone }));
+  if (!state.selectedShapeZone || !before.length) return;
+  const zoneWallKey = `${id}@${before[state.selectedShapeZone - 1].id}`;
+  const beforeWall = { ...(state.wallEdits.get(zoneWallKey) || {}) };
+  const after = before.filter((_, index) => index !== state.selectedShapeZone - 1);
+  if (after.length) state.shapeZones.set(id, after); else state.shapeZones.delete(id);
+  state.wallEdits.delete(zoneWallKey);
+  state.selectedShapeZone = 0;
+  state.modelEditUndo.push({ type: "shape-zones", id, before, after, zoneWallKey, beforeWall, afterWall: {} });
+  state.modelEditRedo = []; persistModelEdits(); syncModelEditHistoryButtons(); updateCalculation();
+});
+ui.modelShapeStart.addEventListener("change", (event) => editShapeZoneRange("start", event.currentTarget.value));
+ui.modelShapeEnd.addEventListener("change", (event) => editShapeZoneRange("end", event.currentTarget.value));
+ui.modelShapeParams.addEventListener("change", (event) => {
+  const input = event.target.closest("[data-shape-param]");
+  if (input) applyModelShapeParameter(input.dataset.shapeParam, input.value);
+});
+ui.modelFloorUses.addEventListener("change", (event) => {
+  const select = event.target.closest("[data-floor-use]");
+  if (!select) return;
+  const id = String(state.selectedFeature?.properties.id || "");
+  const before = { ...(state.floorUses.get(id) || {}) };
+  const after = { ...before };
+  if (select.value === "residencial") delete after[select.dataset.floorUse];
+  else after[select.dataset.floorUse] = select.value;
+  if (Object.keys(after).length) state.floorUses.set(id, after); else state.floorUses.delete(id);
+  state.modelEditUndo.push({ type: "floor-use", id, before, after });
+  state.modelEditRedo = []; persistModelEdits(); syncModelEditHistoryButtons(); updateMapModel(state.modelInputs);
+});
+ui.modelParcelFaces.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-parcel-face]");
+  if (!button) return;
+  state.selectedParcelFace = button.dataset.parcelFace;
+  renderModelEditor();
+});
+ui.modelParcelActiveFront.addEventListener("change", () => saveParcelFaceSetting({ active: ui.modelParcelActiveFront.checked }));
+ui.modelParcelRoadWidth.addEventListener("change", () => saveParcelFaceSetting({ width: clamp(Number(ui.modelParcelRoadWidth.value) || 8, 6, 80) }));
+ui.modelParcelRetreat.addEventListener("change", () => saveParcelFaceSetting({ retreat: clamp(Number(ui.modelParcelRetreat.value) || 0, 0, 30) }));
+ui.modelProgramUse.addEventListener("change", () => {
+  ui.use.value = ui.modelProgramUse.value;
+  state.currentUse = ui.modelProgramUse.value;
+  updateCalculation();
+});
 ui.modelFaceOffset.addEventListener("pointerdown", beginWallControlEdit);
 ui.modelFaceOffset.addEventListener("focus", beginWallControlEdit);
 ui.modelFaceOffsetNumber.addEventListener("focus", beginWallControlEdit);
@@ -1477,15 +2413,25 @@ map.on("mousedown", (event) => {
   const wall = raycastEditableWall(event.point);
   if (wall) {
     const id = String(wall.hit.properties.lotId);
+    const wallFloor = Number(wall.hit.properties.floor) || 1;
+    const zoneIndex = modelZoneIndexForFloor(id, wallFloor);
     const edgeKey = `${wall.polygonIndex}:${wall.edgeIndex}`;
-    const offsets = state.wallEdits.get(id) || {};
-    const currentValue = Number(offsets[edgeKey]) || 0;
-    state.modelDimension = { lotId: id, value: wall.edgeLength };
-    state.selectedWall = { lotId: id, edgeKey, polygonIndex: wall.polygonIndex, edgeIndex: wall.edgeIndex };
+    const model = state.modelInputs.find((item) => String(item.values.lotId) === id);
+    const context = model && modelFaceContext(model, zoneIndex);
+    const base = context?.base;
+    const face = base && buildEditableFaceGroups(base).find((item) => item.edges.some((edge) => edge.key === edgeKey));
+    if (!face) return;
+    const dragAxis = projectFaceDragAxis(base, face, ((Number(wall.hit.properties.base) || 0) + (Number(wall.hit.properties.height) || 0)) / 2) || wall;
+    const offsets = state.wallEdits.get(context.editKey) || {};
+    const currentValue = averageFaceOffset(offsets, face);
+    state.selectedShapeZone = zoneIndex;
+    selectModelEditorTab("shape");
+    state.selectedWall = { lotId: id, editKey: context.editKey, zoneIndex, faceKey: face.key, edgeKeys: face.edges.map((edge) => edge.key), polygonIndex: face.edges[0].polygonIndex, edgeIndex: face.edges[0].edgeIndex };
+    state.modelDimension = { lotId: id, value: face.length };
     state.activeModelDrag = {
-      type: "wall", id, edgeKey, startX: event.point.x, startY: event.point.y,
-      startValue: currentValue, beforeOverride: offsets[edgeKey], normalScreen: wall.normalScreen,
-      pxPerMeter: wall.pxPerMeter, edgeLength: wall.edgeLength, polygonIndex: wall.polygonIndex,
+      type: "wall", id, editKey: context.editKey, zoneIndex, face, faceKey: face.key, edgeKey, startX: event.point.x, startY: event.point.y,
+      startValue: currentValue, beforeOverride: offsets[edgeKey], startOffsets: { ...offsets }, normalScreen: dragAxis.normalScreen,
+      pxPerMeter: dragAxis.pxPerMeter, edgeLength: face.length, polygonIndex: wall.polygonIndex,
       dragPanEnabled: map.dragPan.isEnabled(), boxZoomEnabled: map.boxZoom.isEnabled(), rotateEnabled: map.dragRotate.isEnabled(), moved: false,
     };
     event.originalEvent.preventDefault();
@@ -1505,13 +2451,10 @@ map.on("mousemove", (event) => {
     const dx = event.point.x - drag.startX; const dy = event.point.y - drag.startY;
     const deltaPixels = dx * drag.normalScreen[0] + dy * drag.normalScreen[1];
     if (Math.abs(deltaPixels) > 2) drag.moved = true;
-    const footprintRatio = Math.max(0.05, 1 - model.values.freeArea / 100);
-    const baseFootprint = scaleGeometry(model.feature.geometry, Math.sqrt(footprintRatio));
-    const offsets = { ...(state.wallEdits.get(drag.id) || {}) };
+    const baseFootprint = modelFaceContext(model, drag.zoneIndex).base;
     const desired = clamp(Math.round((drag.startValue + deltaPixels / drag.pxPerMeter) * 10) / 10, -25, 25);
-    const nextValue = constrainWallOffset(model, baseFootprint, drag.edgeKey, drag.startValue, desired, offsets);
-    offsets[drag.edgeKey] = nextValue;
-    state.wallEdits.set(drag.id, offsets);
+    const { offsets } = constrainWallFaceOffsets(model, baseFootprint, drag.face, drag.startOffsets, desired);
+    if (Object.keys(offsets).length) state.wallEdits.set(drag.editKey, offsets); else state.wallEdits.delete(drag.editKey);
     state.modelDimension = { lotId: drag.id, value: drag.edgeLength };
     updateCalculation();
     return;
@@ -1521,35 +2464,19 @@ map.on("mousemove", (event) => {
 map.on("mouseup", finishModelDrag);
 window.addEventListener("mouseup", finishModelDrag);
 window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && state.pushPullMode) {
-    finishModelDrag();
-    state.pushPullMode = false;
-    state.modelEditorOpen = false;
-    ui.pushPull.classList.remove("is-active");
-    ui.pushPull.setAttribute("aria-pressed", "false");
-    document.querySelector(".map-shell").classList.remove("push-pull-active");
-    ui.modelEditor.classList.add("is-hidden"); ui.modelEditorBackdrop.classList.add("is-hidden"); state.selectedWall = null; state.modelDimension = null; setSelectedFaceOverlay();
-    updateMapModel(state.modelInputs);
-    return;
+  if (event.key === "Escape") {
+    if (state.modelEditorOpen) closeLotEditor();
+    else {
+      setDetailPanel(false);
+      setOpacityPanel(false);
+      ui.layersPanel.classList.add("is-hidden");
+      ui.layersButton.setAttribute("aria-expanded", "false");
+    }
   }
-  if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
-  const target = event.target;
-  if (target instanceof HTMLElement && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
-  if (event.key.toLowerCase() === "z") {
-    event.preventDefault(); event.shiftKey ? redoModelEdit() : undoModelEdit();
-  } else if (event.key.toLowerCase() === "y") {
-    event.preventDefault(); redoModelEdit();
-  }
-});
-
-ui.opacity.addEventListener("input", () => {
-  state.fillOpacity = Number(ui.opacity.value) / 100;
-  ui.opacityOutput.textContent = `${ui.opacity.value}%`;
-  if (state.ready) map.setPaintProperty("lots-fill", "fill-opacity", state.fillOpacity);
 });
 
 ui.satelliteOpacity.addEventListener("input", () => {
-  state.satelliteOpacity = Number(ui.satelliteOpacity.value) / 100;
+  state.satelliteOpacity = 1 - Number(ui.satelliteOpacity.value) / 100;
   ui.satelliteOpacityOutput.textContent = `${ui.satelliteOpacity.value}%`;
   if (state.ready) map.setPaintProperty("satellite", "raster-opacity", state.satelliteOpacity);
 });
@@ -1620,6 +2547,7 @@ ui.results.addEventListener("click", (event) => {
 
 ui.use.addEventListener("change", () => {
   state.currentUse = ui.use.value;
+  if (ui.modelProgramUse) ui.modelProgramUse.value = state.currentUse;
   updateCalculation();
 });
 ui.roadSelect.addEventListener("change", () => applyRoadCandidate(ui.roadSelect.value));
@@ -1660,7 +2588,6 @@ ui.epapCondition.addEventListener("change", updateEpapRules);
 
 function printTechnicalSheet() {
   if (!state.selectedFeature) return;
-  ui.welcome.classList.add("is-hidden");
   const previousTitle = document.title;
   document.title = `Ficha_${state.selectedFeature.properties.zona}_ID_${state.selectedFeature.properties.id}_San_Borja`;
   window.print();
